@@ -74,7 +74,7 @@ public class GameActivity extends Activity {
 
     private static final String DEFAULT_CORE_ASSET_PATH = "cores/snes9x_libretro_android.so";
     private static final String DEFAULT_CORE_FILENAME = "snes9x_libretro_android.so";
-    private static final String DEFAULT_ROOM_SERVER_URL = "http://snesonline.freedynamicdns.net:8787";
+    private static final String DEFAULT_ROOM_SERVER_URL = "https://snes-online-1hgm.onrender.com";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -229,15 +229,23 @@ public class GameActivity extends Activity {
             }
 
             if (role == 1) {
-                // Player 1 must provide its public UDP port (UDP WHOAMI) to finalize the room.
+                // Player 1 must provide its public (NAT-mapped) UDP port (via STUN) to finalize the room.
                 if (port == 0) {
-                    int publicPort = udpWhoamiPublicPort(baseUrl, localPort);
+                    int publicPort = NativeBridge.nativeStunPublicUdpPort(localPort);
+                    if (publicPort < 1 || publicPort > 65535) {
+                        throw new Exception("STUN failed (cannot discover public UDP port)");
+                    }
                     JSONObject r1 = postRoomConnect(baseUrl, code, password, publicPort, creatorToken);
                     role = r1.optInt("role", 1);
                     waiting = r1.optBoolean("waiting", false);
                     room = r1.optJSONObject("room");
                     port = (room != null) ? room.optInt("port", publicPort) : publicPort;
-                    ip = (room != null) ? room.optString("ip", "") : "";
+                    if (room != null) {
+                        String localIp = room.optString("localIp", "");
+                        ip = (localIp != null && !localIp.isEmpty()) ? localIp : room.optString("ip", "");
+                    } else {
+                        ip = "";
+                    }
                 }
 
                 out.ok = true;
@@ -355,48 +363,6 @@ public class GameActivity extends Activity {
             if (ok) out.append(c);
         }
         return out.toString();
-    }
-
-    private static int udpWhoamiPublicPort(String baseUrl, int localPort) throws Exception {
-        URL u = new URL(baseUrl);
-        String host = u.getHost();
-        int port = u.getPort();
-        if (port <= 0) port = u.getDefaultPort();
-        if (port <= 0) port = 8787;
-
-        Inet4Address ipv4 = resolveIpv4BestEffort(host);
-        if (ipv4 == null) throw new Exception("No IPv4 for " + host);
-
-        byte[] req = "SNO_WHOAMI1\n".getBytes(StandardCharsets.UTF_8);
-        byte[] buf = new byte[256];
-
-        try (DatagramSocket sock = new DatagramSocket(localPort)) {
-            sock.setSoTimeout(1500);
-            DatagramPacket p = new DatagramPacket(req, req.length, ipv4, port);
-            sock.send(p);
-
-            DatagramPacket r = new DatagramPacket(buf, buf.length);
-            sock.receive(r);
-            String s = new String(r.getData(), 0, r.getLength(), StandardCharsets.UTF_8).trim();
-            if (!s.startsWith("SNO_SELF1")) throw new Exception("Unexpected UDP reply");
-            String[] parts = s.split("\\s+");
-            if (parts.length < 3) throw new Exception("Bad UDP reply");
-            int publicPort = Integer.parseInt(parts[2]);
-            if (publicPort < 1 || publicPort > 65535) throw new Exception("Bad public port");
-            return publicPort;
-        }
-    }
-
-    private static Inet4Address resolveIpv4BestEffort(String host) {
-        try {
-            InetAddress[] all = InetAddress.getAllByName(host);
-            for (InetAddress a : all) {
-                if (a instanceof Inet4Address) return (Inet4Address) a;
-            }
-            return null;
-        } catch (Exception ignored) {
-            return null;
-        }
     }
 
     private static String localLanIpv4BestEffort() {

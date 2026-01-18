@@ -27,6 +27,7 @@
 #include "snesonline/InputMapping.h"
 #include "snesonline/LockstepSession.h"
 #include "snesonline/NetplaySession.h"
+#include "snesonline/StunClient.h"
 
 #include "ConfigDialog.h"
 
@@ -682,7 +683,7 @@ static bool roomConnectAtStart(const snesonline::AppConfig& cfg, uint16_t localP
     outHostPort = 0;
     outError.clear();
 
-    constexpr const char* kDefaultRoomServerUrl = "http://snesonline.freedynamicdns.net:8787";
+    constexpr const char* kDefaultRoomServerUrl = "https://snes-online-1hgm.onrender.com";
     const std::string url = cfg.roomServerUrl.empty() ? std::string(kDefaultRoomServerUrl) : cfg.roomServerUrl;
     const std::string code = normalizeRoomCode(cfg.roomCode);
     const std::string password = trimAscii(cfg.roomPassword);
@@ -703,14 +704,25 @@ static bool roomConnectAtStart(const snesonline::AppConfig& cfg, uint16_t localP
 
     if (r0.role == 1) {
         const std::string creatorToken = r0.creatorToken;
-        // Finalize with UDP WHOAMI if needed.
+        // Finalize with a discovered public UDP port.
         RoomConnectResp rFinal = r0;
         if (r0.port == 0 || r0.waiting) {
             uint16_t publicPort = 0;
-            if (!udpWhoamiPublicPort(url, localPort, publicPort)) {
-                outError = "udp_whoami_failed";
-                return false;
+
+            // Preferred: STUN (public servers). Works even if the room server has no UDP.
+            snesonline::StunMappedAddress mapped;
+            if (snesonline::stunDiscoverMappedAddressDefault(localPort, mapped)) {
+                publicPort = mapped.port;
             }
+
+            // Fallback: legacy UDP WHOAMI to the room server.
+            if (publicPort == 0) {
+                if (!udpWhoamiPublicPort(url, localPort, publicPort)) {
+                    outError = "stun_failed";
+                    return false;
+                }
+            }
+
             RoomConnectResp r1 = winHttpPostRoomConnect(url, code, password, publicPort, creatorToken);
             if (!r1.ok) {
                 outError = r1.error.empty() ? "finalize_failed" : r1.error;
@@ -720,7 +732,7 @@ static bool roomConnectAtStart(const snesonline::AppConfig& cfg, uint16_t localP
         }
 
         outRole = 1;
-        outHostIp = rFinal.ip;
+        outHostIp = rFinal.localIp.empty() ? rFinal.ip : rFinal.localIp;
         outHostPort = rFinal.port;
         return true;
     }

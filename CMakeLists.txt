@@ -16,6 +16,7 @@ add_library(snesonline_core STATIC
     src/AppConfig.cpp
     src/EmulatorEngine.cpp
     src/LibretroCore.cpp
+    src/StunClient.cpp
 )
 
 target_include_directories(snesonline_core PUBLIC

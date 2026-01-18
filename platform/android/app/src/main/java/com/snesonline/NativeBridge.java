@@ -36,6 +36,10 @@ public final class NativeBridge {
     // 0=off, 1=connecting (no peer yet), 2=waiting (peer but missing inputs), 3=ok
     public static native int nativeGetNetplayStatus();
 
+    // Networking helpers
+    // Returns the best-effort public mapped UDP port for a socket bound to localPort (0 on failure).
+    public static native int nativeStunPublicUdpPort(int localPort);
+
     // Audio
     // Returns frames written into dst (dst length must be framesWanted*2)
     public static native int nativeGetAudioSampleRateHz();

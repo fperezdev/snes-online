@@ -27,7 +27,7 @@ import java.nio.charset.StandardCharsets;
 public class ConfigActivity extends Activity {
     private static final int REQ_PICK_ROM = 1002;
 
-    private static final String DEFAULT_ROOM_SERVER_URL = "http://snesonline.freedynamicdns.net:8787";
+    private static final String DEFAULT_ROOM_SERVER_URL = "https://snes-online-1hgm.onrender.com";
 
     private static final String PREFS = "snesonline";
     private static final String PREF_ROM_PATH = "romPath";
@@ -198,37 +198,6 @@ public class ConfigActivity extends Activity {
             i.putExtra("roomPassword", netplayEnabled ? roomPassword : "");
             startActivity(i);
         });
-    }
-
-    private static int udpWhoamiPublicPort(String baseUrl, int localPort) throws Exception {
-        URL u = new URL(baseUrl);
-        String host = u.getHost();
-        int port = u.getPort();
-        if (port <= 0) {
-            port = u.getDefaultPort();
-        }
-        if (port <= 0) port = 8787;
-
-        Inet4Address ipv4 = resolveIpv4BestEffort(host);
-        if (ipv4 == null) throw new Exception("No IPv4 for " + host);
-
-        byte[] req = "SNO_WHOAMI1\n".getBytes(StandardCharsets.UTF_8);
-        byte[] buf = new byte[256];
-
-        try (DatagramSocket sock = new DatagramSocket(localPort)) {
-            sock.setSoTimeout(1500);
-            DatagramPacket p = new DatagramPacket(req, req.length, ipv4, port);
-            sock.send(p);
-
-            DatagramPacket r = new DatagramPacket(buf, buf.length);
-            sock.receive(r);
-            String s = new String(r.getData(), 0, r.getLength(), StandardCharsets.UTF_8).trim();
-            if (!s.startsWith("SNO_SELF1")) throw new Exception("Unexpected UDP reply");
-            String[] parts = s.split("\\s+");
-            if (parts.length < 3) throw new Exception("Bad UDP reply");
-            int publicPort = Integer.parseInt(parts[2]);
-            return publicPort;
-        }
     }
 
     private static boolean isValidRoomServerUrl(String s) {

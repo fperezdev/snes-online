@@ -16,7 +16,7 @@
 
 namespace {
 
-constexpr const char* kDefaultRoomServerUrl = "http://snesonline.freedynamicdns.net:8787";
+constexpr const char* kDefaultRoomServerUrl = "https://snes-online-1hgm.onrender.com";
 
 constexpr int IDD_CONFIG = 101;
 

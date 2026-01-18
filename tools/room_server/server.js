@@ -62,6 +62,8 @@ function parseArgs(argv) {
     logConnections: false,
     apkPath: '',
     zipPath: '',
+    apkUrl: '',
+    zipUrl: '',
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -75,10 +77,19 @@ function parseArgs(argv) {
     else if (a === '--log-connections') out.logConnections = true;
     else if (a === '--apk' || a === '--apk-path') out.apkPath = next();
     else if (a === '--zip' || a === '--zip-path') out.zipPath = next();
+    else if (a === '--apk-url') out.apkUrl = next();
+    else if (a === '--zip-url') out.zipUrl = next();
   }
   out.defaultTtl = Math.max(30, out.defaultTtl | 0);
   out.maxTtl = Math.max(60, out.maxTtl | 0);
   return out;
+}
+
+function normalizeHttpUrl(v) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  if (s.startsWith('http://') || s.startsWith('https://')) return s;
+  return '';
 }
 
 function isTruthyEnv(v) {
@@ -231,6 +242,14 @@ function sendFile(res, filePath, downloadName, contentType) {
     });
     stream.pipe(res);
   });
+}
+
+function sendRedirect(res, url) {
+  res.writeHead(302, {
+    Location: url,
+    'Cache-Control': 'no-store',
+  });
+  res.end();
 }
 
 class RoomStore {
@@ -440,6 +459,8 @@ async function main() {
   const root = repoRoot();
   const apkPath = (args.apkPath || '').trim() || defaultApkPath(root);
   const zipPath = (args.zipPath || '').trim() || defaultZipPath(root);
+  const apkUrl = normalizeHttpUrl(args.apkUrl || process.env.SNO_APK_URL || process.env.ROOM_SERVER_APK_URL);
+  const zipUrl = normalizeHttpUrl(args.zipUrl || process.env.SNO_ZIP_URL || process.env.ROOM_SERVER_ZIP_URL);
 
   setInterval(() => store.purgeExpired(), 10_000).unref();
   setInterval(() => punch.purgeExpired(), 5_000).unref();
@@ -453,10 +474,12 @@ async function main() {
     }
 
     if (req.method === 'GET' && path === '/download/apk') {
+      if (apkUrl) return sendRedirect(res, apkUrl);
       return sendFile(res, apkPath, 'snes-online.apk', 'application/vnd.android.package-archive');
     }
 
     if (req.method === 'GET' && path === '/download/zip') {
+      if (zipUrl) return sendRedirect(res, zipUrl);
       const name = pathMod.basename(zipPath) || 'snes-online-win64-portable.zip';
       return sendFile(res, zipPath, name, 'application/zip');
     }
@@ -679,6 +702,8 @@ async function main() {
     console.log(`Room server listening on http://${args.host}:${args.port}`);
     console.log('Endpoints: POST /rooms/connect, PUT/GET/DELETE /rooms/{CODE}, GET /health');
     console.log('Downloads: GET /download/apk, GET /download/zip');
+    console.log(`Download APK: ${apkUrl ? `redirect ${apkUrl}` : `file ${apkPath}`}`);
+    console.log(`Download ZIP: ${zipUrl ? `redirect ${zipUrl}` : `file ${zipPath}`}`);
     console.log(`UDP punch: send "SNO_WHOAMI1" or "SNO_PUNCH1 CODE" to udp://${args.host}:${args.udpPort || args.port}`);
     if (apiKey) console.log('Auth: requires header X-API-Key');
   });

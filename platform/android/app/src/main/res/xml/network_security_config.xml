@@ -5,6 +5,6 @@
 
   <!-- Allow HTTP only to the room server domain (Android 9+ blocks cleartext by default). -->
   <domain-config cleartextTrafficPermitted="true">
-    <domain includeSubdomains="true">snesonline.freedynamicdns.net</domain>
+    <domain includeSubdomains="true">snes-online-1hgm.onrender.com</domain>
   </domain-config>
 </network-security-config>

@@ -77,7 +77,7 @@ In **ConfigActivity**, set:
 - **Local UDP Port** (default `7000`)
 
 At game start:
-- The first device to start becomes **Player 1** and performs a server-assisted WHOAMI punch.
+- The first device to start becomes **Player 1** and discovers its public (NAT-mapped) UDP port via **STUN**.
 - The second device becomes **Player 2** and connects using the endpoint returned by the room server.
 
 ### Internet play

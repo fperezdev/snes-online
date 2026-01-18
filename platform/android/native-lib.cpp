@@ -13,6 +13,7 @@
 #include "snesonline/EmulatorEngine.h"
 #include "snesonline/InputBits.h"
 #include "snesonline/InputMapping.h"
+#include "snesonline/StunClient.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -731,6 +732,17 @@ Java_com_snesonline_NativeBridge_nativeShutdown(JNIEnv* /*env*/, jclass /*cls*/)
 extern "C" JNIEXPORT jint JNICALL
 Java_com_snesonline_NativeBridge_nativeGetNetplayStatus(JNIEnv* /*env*/, jclass /*cls*/) {
     return static_cast<jint>(g_netplayStatus.load(std::memory_order_relaxed));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_snesonline_NativeBridge_nativeStunPublicUdpPort(JNIEnv* /*env*/, jclass /*cls*/, jint localPort) {
+    const uint16_t lp = static_cast<uint16_t>((localPort >= 1 && localPort <= 65535) ? localPort : 0);
+    if (lp == 0) return 0;
+
+    snesonline::StunMappedAddress mapped;
+    if (!snesonline::stunDiscoverMappedAddressDefault(lp, mapped)) return 0;
+    if (mapped.port < 1 || mapped.port > 65535) return 0;
+    return static_cast<jint>(mapped.port);
 }
 
 // Called by Activity/GL thread on MotionEvent.

@@ -102,7 +102,7 @@ Key points:
 - Room Code netplay is **room-only** (no Direct IP UI).
 - A **room password is required**.
 - The connection is established **at game start** and only exists while the game is running.
-- The **first device to start the game** becomes **Player 1** (host) and performs a UDP WHOAMI punch to learn its public port.
+- The **first device to start the game** becomes **Player 1** (host) and discovers its public (NAT-mapped) UDP port via **STUN**.
 - The second device becomes **Player 2** and connects using the host endpoint returned by the room server.
 - This is still P2P UDP (not a relay). Hard NAT / CGNAT may still require a VPN overlay.
 
@@ -113,7 +113,7 @@ LAN optimization:
 1) Open the configuration UI (`--config` or `F1`).
 2) Set:
 	- **Local UDP Port** (default 7000)
-	- **Room Server URL** (default: `http://snesonline.freedynamicdns.net:8787`)
+	- **Room Server URL** (default: `https://snes-online-1hgm.onrender.com`)
 	- **Room Code** (8–12 letters/numbers)
 	- **Room Password** (required)
 3) Start the game on both devices. The first starter becomes Player 1 automatically.
@@ -141,9 +141,9 @@ Endpoints:
 - `GET /download/apk` and `GET /download/zip`
 
 Security/behavior:
-- The server stores the creator’s public IP (`room.ip`) from the HTTP request and the discovered public UDP port (WHOAMI).
+- The server stores the creator’s public IP (`room.ip`) from the HTTP request and the discovered public UDP port (STUN / legacy WHOAMI).
 - The server may accept a best-effort client LAN IPv4 (`room.localIp`) and only returns it to clients that share the same public IP.
-- Player 1 receives a `creatorToken` and must provide it when finalizing the room after WHOAMI.
+- Player 1 receives a `creatorToken` and must provide it when finalizing the room after port discovery.
 - The room password is hashed server-side.
 
 ## Netplay (GGPO) (experimental / desktop-only)
