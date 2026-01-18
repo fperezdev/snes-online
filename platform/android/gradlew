@@ -1,0 +1,14 @@
+#!/usr/bin/env sh
+
+# Minimal Gradle wrapper bootstrapper.
+
+DIRNAME=$(dirname "$0")
+APP_HOME=$(cd "$DIRNAME" && pwd)
+
+if [ -n "$JAVA_HOME" ] ; then
+  JAVA_EXE="$JAVA_HOME/bin/java"
+else
+  JAVA_EXE="java"
+fi
+
+exec "$JAVA_EXE" -classpath "$APP_HOME/gradle/wrapper/gradle-wrapper.jar:$APP_HOME/gradle/wrapper/gradle-wrapper-shared.jar:$APP_HOME/gradle/wrapper/gradle-cli.jar" org.gradle.wrapper.GradleWrapperMain "$@"

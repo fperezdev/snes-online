@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+  <!-- Default: block cleartext traffic everywhere. -->
+  <base-config cleartextTrafficPermitted="false" />
+
+  <!-- Allow HTTP only to the room server domain (Android 9+ blocks cleartext by default). -->
+  <domain-config cleartextTrafficPermitted="true">
+    <domain includeSubdomains="true">snesonline.freedynamicdns.net</domain>
+  </domain-config>
+</network-security-config>

@@ -1,0 +1,38 @@
+name: SnesOnline
+options:
+  bundleIdPrefix: com.snesonline
+  deploymentTarget:
+    iOS: "14.0"
+settings:
+  base:
+    SWIFT_VERSION: 5.0
+    CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+    CLANG_CXX_LIBRARY: "libc++"
+    HEADER_SEARCH_PATHS:
+      - "$(SRCROOT)/../../include"
+    OTHER_CPLUSPLUSFLAGS:
+      - "-std=c++17"
+
+targets:
+  SnesOnline:
+    type: application
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.snesonline.snesonline
+        INFOPLIST_FILE: app/Info.plist
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+          - "@loader_path/Frameworks"
+    sources:
+      - path: app/Sources
+      - path: ../ios
+        includes:
+          - SNESOnlineIOSBridge.mm
+          - SNESOnlineIOSNative.mm
+      - path: ../../src
+      - path: ../../include
+        type: folder
+    resources:
+      - path: app/Resources

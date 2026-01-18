@@ -1,0 +1,51 @@
+# Local cores/ROMs (do not commit)
+cores/**
+roms/**
+!cores/.gitkeep
+!roms/.gitkeep
+
+# Build outputs
+build/
+build_vs/
+
+# Common CMake build dirs
+cmake-build-*/
+
+# VS / CMake user files
+**/.vs/
+**/.vscode/
+**/*.VC.db
+**/*.VC.VC.opendb
+**/*.suo
+**/*.user
+**/*.userosscache
+**/*.sln.docstates
+**/CMakeSettings.json
+**/CMakeUserPresets.json
+**/CMakePresets.json
+
+# Windows cruft
+**/Thumbs.db
+**/Desktop.ini
+
+# Android local config + signing (do not commit)
+platform/android/local.properties
+platform/android/keystore.properties
+platform/android/*.keystore
+platform/android/*.jks
+
+# Android Gradle build outputs
+platform/android/**/build/
+
+# Android native build outputs (very long paths)
+platform/android/**/.cxx/
+platform/android/**/.externalNativeBuild/
+
+# Android/Gradle local caches
+platform/android/**/.gradle/
+
+# Android Studio
+platform/android/.idea/
+
+# Node
+**/node_modules/

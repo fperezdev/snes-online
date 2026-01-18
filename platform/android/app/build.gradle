@@ -1,0 +1,131 @@
+plugins {
+    id 'com.android.application'
+}
+
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
+android {
+    namespace 'com.snesonline'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.snesonline'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '0.1.0'
+
+        externalNativeBuild {
+            cmake {
+                // Work around Windows MAX_PATH issues from nested FetchContent paths
+                // (e.g. .cxx/.../_deps/.../snesonline_ggpo_src-populate-...).
+                def fetchContentBase = System.getenv('SNESONLINE_FETCHCONTENT_BASE') ?: 'C:/_snesonline_fc'
+
+                // Build the existing CMake project, but enable the Android JNI target.
+                arguments '-DSNESONLINE_BUILD_ANDROID_JNI=ON',
+                          '-DSNESONLINE_BUILD_WINDOWS_APP=OFF',
+                          '-DSNESONLINE_ENABLE_GGPO=OFF',
+                          "-DFETCHCONTENT_BASE_DIR=${fetchContentBase}"
+                cppFlags '-std=c++17'
+            }
+        }
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // Make release APK installable.
+            // - Preferred: provide platform/android/keystore.properties for a real release key.
+            // - Fallback: sign with debug key for local installs (not for Play Store).
+            if (keystorePropertiesFile.exists()) {
+                signingConfig signingConfigs.release
+            } else {
+                signingConfig signingConfigs.debug
+            }
+        }
+        debug {
+            debuggable true
+        }
+    }
+
+    signingConfigs {
+        release {
+            if (keystorePropertiesFile.exists()) {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('../../../CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+}
+
+dependencies {
+    // No external deps required for the minimal flow.
+}
+
+// --- Bundled libretro core(s) ---
+// We bundle a default SNES core into the APK assets at build time.
+// This keeps the repo free of third-party binaries while still producing an APK with a core preinstalled.
+def bundledCoreZipUrl = 'https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/snes9x_libretro_android.so.zip'
+def bundledCoreSoName = 'snes9x_libretro_android.so'
+
+tasks.register('downloadBundledCores') {
+    doLast {
+        def assetsCoreDir = file('src/main/assets/cores')
+        assetsCoreDir.mkdirs()
+
+        def outSo = new File(assetsCoreDir, bundledCoreSoName)
+        if (outSo.exists() && outSo.length() > 0) {
+            logger.lifecycle("Bundled core already present: ${outSo}")
+            return
+        }
+
+        def downloadsDir = new File(buildDir, 'downloads')
+        downloadsDir.mkdirs()
+        def zipFile = new File(downloadsDir, 'snes9x_libretro_android.so.zip')
+
+        logger.lifecycle("Downloading bundled core: ${bundledCoreZipUrl}")
+        new URL(bundledCoreZipUrl).withInputStream { input ->
+            zipFile.withOutputStream { output ->
+                output << input
+            }
+        }
+
+        copy {
+            from(zipTree(zipFile))
+            include("**/${bundledCoreSoName}")
+            into(assetsCoreDir)
+        }
+
+        if (!(outSo.exists() && outSo.length() > 0)) {
+            throw new GradleException("Failed to bundle core into assets: ${outSo}")
+        }
+
+        logger.lifecycle("Bundled core saved to assets: ${outSo}")
+    }
+}
+
+// Ensure the core is bundled before the Android build packages assets.
+preBuild.dependsOn(tasks.named('downloadBundledCores'))

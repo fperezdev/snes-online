@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Core: Snes9x (bundled)" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="ROM (.sfc/.smc)" />
+
+        <EditText
+            android:id="@+id/editRomPath"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Pick a ROM file" />
+
+        <Button
+            android:id="@+id/btnPickRom"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Pick ROM" />
+
+        <Switch
+            android:id="@+id/switchOnscreenControls"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Show on-screen controls (touch)" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Netplay" />
+
+        <Switch
+            android:id="@+id/switchNetplay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Enable Netplay" />
+
+        <LinearLayout
+            android:id="@+id/layoutRoom"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Room Code (optional)" />
+
+        <EditText
+            android:id="@+id/editRoomServerUrl"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Room server URL (e.g. http://example.com:8787)"
+            android:inputType="textUri" />
+
+        <EditText
+            android:id="@+id/editRoomPassword"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Room password (required)"
+            android:inputType="textPassword" />
+
+        <EditText
+            android:id="@+id/editLocalPort"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Local UDP port (default 7000)"
+            android:inputType="number" />
+
+        <EditText
+            android:id="@+id/editRoomCode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Room code (8-12 letters/numbers)" />
+
+        <!-- No connect button: connection occurs when pressing Start -->
+
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btnStart"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="Start Game" />
+
+        <TextView
+            android:id="@+id/txtStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="Internet play tip: easiest is a VPN overlay (Tailscale/ZeroTier). Otherwise you need router port-forwarding for UDP." />
+
+    </LinearLayout>
+
+</ScrollView>
