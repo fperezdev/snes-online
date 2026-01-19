@@ -74,7 +74,7 @@ private:
     void (*retro_set_input_poll_)(void (*)(void)) = nullptr;
     void (*retro_set_input_state_)(int16_t (*)(unsigned, unsigned, unsigned, unsigned)) = nullptr;
 
-    bool (*retro_get_system_av_info_)(void* /*retro_system_av_info*/ ) = nullptr;
+    void (*retro_get_system_av_info_)(void* /*retro_system_av_info*/ ) = nullptr;
     void (*retro_set_environment_)(bool (*)(unsigned, void*)) = nullptr;
     void (*retro_set_video_refresh_)(void (*)(const void*, unsigned, unsigned, size_t)) = nullptr;
     void (*retro_set_audio_sample_)(void (*)(int16_t, int16_t)) = nullptr;

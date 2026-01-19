@@ -75,7 +75,7 @@ bool LibretroCore::load(const char* corePath) noexcept {
     retro_set_input_poll_ = reinterpret_cast<void (*)(void (*)(void))>(resolve_("retro_set_input_poll"));
     retro_set_input_state_ = reinterpret_cast<void (*)(int16_t (*)(unsigned, unsigned, unsigned, unsigned))>(resolve_("retro_set_input_state"));
 
-    retro_get_system_av_info_ = reinterpret_cast<bool (*)(void*)>(resolve_("retro_get_system_av_info"));
+    retro_get_system_av_info_ = reinterpret_cast<void (*)(void*)>(resolve_("retro_get_system_av_info"));
     retro_set_environment_ = reinterpret_cast<void (*)(bool (*)(unsigned, void*))>(resolve_("retro_set_environment"));
     retro_set_video_refresh_ = reinterpret_cast<void (*)(void (*)(const void*, unsigned, unsigned, size_t))>(resolve_("retro_set_video_refresh"));
     retro_set_audio_sample_ = reinterpret_cast<void (*)(void (*)(int16_t, int16_t))>(resolve_("retro_set_audio_sample"));
@@ -187,10 +187,9 @@ bool LibretroCore::loadGame(const char* romPath) noexcept {
 
     if (retro_get_system_av_info_) {
         RetroSystemAvInfo av{};
-        if (retro_get_system_av_info_(&av)) {
-            if (av.timing.fps > 1.0) fps_ = av.timing.fps;
-            if (av.timing.sample_rate > 1000.0) sampleRateHz_ = av.timing.sample_rate;
-        }
+        retro_get_system_av_info_(&av);
+        if (av.timing.fps > 1.0) fps_ = av.timing.fps;
+        if (av.timing.sample_rate > 1000.0) sampleRateHz_ = av.timing.sample_rate;
     }
 
     // Map negotiated pixel format into the public enum.

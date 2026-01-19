@@ -40,13 +40,6 @@
             android:layout_marginTop="16dp"
             android:text="Audio" />
 
-        <Switch
-            android:id="@+id/switchAudioDebugCapture"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="Audio debug capture (writes WAV to app storage)" />
-
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

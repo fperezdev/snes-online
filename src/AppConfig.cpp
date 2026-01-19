@@ -9,6 +9,9 @@
 
 #if defined(_WIN32)
 #include <ShlObj.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <Windows.h>
 #endif
 
@@ -92,6 +95,17 @@ static uint8_t parsePlayerNum(const std::string& v, uint8_t fallback) {
     if (t == "1") return 1;
     if (t == "2") return 2;
     return fallback;
+}
+
+static uint32_t parseU32(const std::string& v, uint32_t fallback) {
+    const std::string t = trim(v);
+    if (t.empty()) return fallback;
+    char* end = nullptr;
+    unsigned long n = std::strtoul(t.c_str(), &end, 10);
+    if (!end || end == t.c_str()) return fallback;
+    if (n == 0) return fallback;
+    if (n > 3600ul) n = 3600ul;
+    return static_cast<uint32_t>(n);
 }
 
 bool loadConfig(const std::string& path, AppConfig& outCfg) {

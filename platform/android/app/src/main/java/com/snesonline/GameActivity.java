@@ -31,9 +31,6 @@ import android.view.SurfaceView;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.io.BufferedOutputStream;
-import java.io.FileWriter;
-import java.io.BufferedWriter;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.Inet4Address;
@@ -67,36 +64,16 @@ public class GameActivity extends Activity {
     private AudioTrack audioTrack;
     // Basic audio configuration (no presets)
     private int audioSampleRateHz = 48000;
+    // Write in device-friendly chunks. A local jitter buffer smooths bursty core output.
     private int audioFramesPerWrite = 1024;
-    private int audioBufferWriteMultiplier = 3;
+    private int audioBufferWriteMultiplier = 4;
     private boolean audioWriteBlocking = true;
 
-    private boolean audioDebugCapture = false;
-    private int audioDebugSeconds = 12;
-    // Debug capture is intentionally designed to not touch disk in the audio thread.
-    // We buffer PCM in memory and write WAV/report on a background thread.
-    private volatile boolean debugCaptureActive = false;
-    private volatile long wavFramesRemaining = 0;
-    private volatile String wavPath = "";
-    private volatile short[] debugCapturePcm = null;
-    private volatile int debugCaptureFramesTarget = 0;
-    private volatile int debugCaptureFramesWritten = 0;
-
-    private long debugStartWallMs = 0;
-    private int debugCaptureSampleRate = 0;
-    private long debugCaptureFramesRequested = 0;
-
-    private String debugOutputSampleRateProperty = "";
-    private String debugOutputFramesPerBufferProperty = "";
-    private int debugAudioTrackSampleRate = 0;
-    private int debugAudioTrackBufferSizeInFrames = 0;
-    private int debugAudioFramesPerWrite = 0;
-    private boolean debugAudioWriteBlocking = true;
-    
-
-    private long audioJavaUnderflowFrames = 0;
-    private long audioJavaZeroPaddedFrames = 0;
-    private long audioJavaWriteErrors = 0;
+    // Local jitter buffer (Java-side) to smooth bursty audio production.
+    private short[] audioJitterPcm = null;
+    private int audioJitterCapacityFrames = 0;
+    private int audioJitterR = 0; // frame index
+    private int audioJitterW = 0; // frame index
 
     private static final int MAX_W = 512;
     private static final int MAX_H = 512;
@@ -165,7 +142,6 @@ public class GameActivity extends Activity {
 
         boolean enableNetplay = getIntent().getBooleanExtra("enableNetplay", false);
         showOnscreenControls = getIntent().getBooleanExtra("showOnscreenControls", true);
-        audioDebugCapture = getIntent().getBooleanExtra("audioDebugCapture", false);
         String remoteHost = getIntent().getStringExtra("remoteHost");
         int remotePort = getIntent().getIntExtra("remotePort", 0);
         int localPort = getIntent().getIntExtra("localPort", 7000);
@@ -179,9 +155,6 @@ public class GameActivity extends Activity {
         if (roomServerUrl == null) roomServerUrl = "";
         if (roomCode == null) roomCode = "";
         if (roomPassword == null) roomPassword = "";
-
-        if (audioDebugSeconds < 3) audioDebugSeconds = 3;
-        if (audioDebugSeconds > 30) audioDebugSeconds = 30;
 
         final String finalRomPath = romPath;
         final String finalCorePath = corePath;
@@ -636,12 +609,19 @@ public class GameActivity extends Activity {
     }
 
     private void setupAudio() {
-        audioSampleRateHz = NativeBridge.nativeGetAudioSampleRateHz();
-        if (audioSampleRateHz < 8000 || audioSampleRateHz > 192000) audioSampleRateHz = 48000;
+        int nativeHzRaw = 0;
+        int tries = 0;
+        // Some cores only report sample rate after the first frame.
+        // Wait a short amount of time to avoid configuring AudioTrack at the wrong rate.
+        for (; tries < 60; ++tries) { // ~600ms worst-case
+            nativeHzRaw = NativeBridge.nativeGetAudioSampleRateHz();
+            if (nativeHzRaw >= 8000 && nativeHzRaw <= 192000) break;
+            try { android.os.SystemClock.sleep(10); } catch (Exception ignored) {}
+        }
 
-        // Optionally capture a short WAV of what we actually feed to AudioTrack.
-        if (audioDebugCapture) {
-            startWavCapture(audioSampleRateHz);
+        audioSampleRateHz = nativeHzRaw;
+        if (audioSampleRateHz < 8000 || audioSampleRateHz > 192000) {
+            audioSampleRateHz = 48000;
         }
 
         final int channelMask = AudioFormat.CHANNEL_OUT_STEREO;
@@ -690,175 +670,6 @@ public class GameActivity extends Activity {
         }
 
         audioTrack.play();
-
-        if (audioDebugCapture) {
-            try {
-                AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
-                String osr = (am != null) ? am.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE) : "";
-                String fpb = (am != null) ? am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER) : "";
-                Log.i(TAG, "Audio debug enabled. sr=" + audioSampleRateHz
-                        + " trackGetSr=" + audioTrack.getSampleRate()
-                        + " outSr=" + osr
-                        + " framesPerBuffer=" + fpb
-                        + " trackBufferBytes=" + audioTrack.getBufferSizeInFrames() * 4);
-            } catch (Exception ignored) {
-            }
-        }
-
-        // Snapshot debug values for report file.
-        try {
-            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
-            debugOutputSampleRateProperty = (am != null) ? String.valueOf(am.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)) : "";
-            debugOutputFramesPerBufferProperty = (am != null) ? String.valueOf(am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)) : "";
-        } catch (Exception ignored) {
-            debugOutputSampleRateProperty = "";
-            debugOutputFramesPerBufferProperty = "";
-        }
-        try {
-            debugAudioTrackSampleRate = audioTrack.getSampleRate();
-        } catch (Exception ignored) {
-            debugAudioTrackSampleRate = 0;
-        }
-        try {
-            debugAudioTrackBufferSizeInFrames = audioTrack.getBufferSizeInFrames();
-        } catch (Exception ignored) {
-            debugAudioTrackBufferSizeInFrames = 0;
-        }
-        debugAudioFramesPerWrite = audioFramesPerWrite;
-        debugAudioWriteBlocking = audioWriteBlocking;
-    }
-
-    private static void writeLE16(BufferedOutputStream out, int v) throws Exception {
-        out.write(v & 0xff);
-        out.write((v >>> 8) & 0xff);
-    }
-
-    private static void writeLE32(BufferedOutputStream out, int v) throws Exception {
-        out.write(v & 0xff);
-        out.write((v >>> 8) & 0xff);
-        out.write((v >>> 16) & 0xff);
-        out.write((v >>> 24) & 0xff);
-    }
-
-    private static void writeWavPcm16Stereo(File file, int sampleRate, short[] interleavedStereo, int frames) throws Exception {
-        // 44-byte PCM WAV header + interleaved stereo S16.
-        final long dataBytes = (long) frames * 4L;
-        final long riffSize = 36L + dataBytes;
-        try (BufferedOutputStream out = new BufferedOutputStream(new FileOutputStream(file, false), 256 * 1024)) {
-            out.write('R'); out.write('I'); out.write('F'); out.write('F');
-            writeLE32(out, (int) Math.min(riffSize, 0x7fffffffL));
-            out.write('W'); out.write('A'); out.write('V'); out.write('E');
-            out.write('f'); out.write('m'); out.write('t'); out.write(' ');
-            writeLE32(out, 16);
-            writeLE16(out, 1);
-            writeLE16(out, 2);
-            writeLE32(out, sampleRate);
-            int byteRate = sampleRate * 2 * 2;
-            writeLE32(out, byteRate);
-            writeLE16(out, 4);
-            writeLE16(out, 16);
-            out.write('d'); out.write('a'); out.write('t'); out.write('a');
-            writeLE32(out, (int) Math.min(dataBytes, 0x7fffffffL));
-
-            int shorts = frames * 2;
-            byte[] buf = new byte[Math.min(64 * 1024, shorts * 2)];
-            int bi = 0;
-            for (int i = 0; i < shorts; i++) {
-                short s = interleavedStereo[i];
-                buf[bi++] = (byte) (s & 0xff);
-                buf[bi++] = (byte) ((s >>> 8) & 0xff);
-                if (bi >= buf.length) {
-                    out.write(buf, 0, bi);
-                    bi = 0;
-                }
-            }
-            if (bi > 0) out.write(buf, 0, bi);
-            out.flush();
-        }
-    }
-
-    private void startWavCapture(int sampleRate) {
-        try {
-            File dir = getExternalFilesDir(null);
-            if (dir == null) dir = getFilesDir();
-            if (dir != null) dir.mkdirs();
-
-            String name = "audio_capture_" + System.currentTimeMillis() + ".wav";
-            File out = new File(dir, name);
-            int targetFrames = (int) Math.min((long) Integer.MAX_VALUE / 2L, (long) sampleRate * (long) audioDebugSeconds);
-            if (targetFrames < 1) targetFrames = sampleRate;
-            debugCapturePcm = new short[targetFrames * 2];
-            debugCaptureFramesTarget = targetFrames;
-            debugCaptureFramesWritten = 0;
-            wavFramesRemaining = targetFrames;
-            wavPath = out.getAbsolutePath();
-            debugCaptureActive = true;
-
-            debugStartWallMs = System.currentTimeMillis();
-            debugCaptureSampleRate = sampleRate;
-            debugCaptureFramesRequested = (long) sampleRate * (long) audioDebugSeconds;
-
-            Log.i(TAG, "WAV capture started: " + wavPath);
-        } catch (Exception e) {
-            debugCaptureActive = false;
-            debugCapturePcm = null;
-            debugCaptureFramesTarget = 0;
-            debugCaptureFramesWritten = 0;
-            wavFramesRemaining = 0;
-            wavPath = "";
-            Log.e(TAG, "WAV capture failed: " + e.getMessage());
-        }
-    }
-
-    private void finishWavCaptureAndWriteReport() {
-        if (!debugCaptureActive) return;
-        debugCaptureActive = false;
-        wavFramesRemaining = 0;
-
-        final String wav = wavPath;
-        wavPath = "";
-
-        final short[] pcm = debugCapturePcm;
-        debugCapturePcm = null;
-        final int frames = Math.max(0, Math.min(debugCaptureFramesWritten, debugCaptureFramesTarget));
-        debugCaptureFramesTarget = 0;
-        debugCaptureFramesWritten = 0;
-
-        if (wav == null || wav.isEmpty() || pcm == null || frames <= 0) return;
-
-        new Thread(() -> {
-            try {
-                File wavFile = new File(wav);
-                writeWavPcm16Stereo(wavFile, debugCaptureSampleRate, pcm, frames);
-
-                File report = new File(wav + ".txt");
-                try (BufferedWriter w = new BufferedWriter(new FileWriter(report, false))) {
-                    w.write("captureSecondsTarget=" + audioDebugSeconds + "\n");
-                    w.write("captureWallMs=" + Math.max(0, System.currentTimeMillis() - debugStartWallMs) + "\n");
-                    w.write("captureSampleRate=" + debugCaptureSampleRate + "\n");
-                    w.write("captureFramesRequested=" + debugCaptureFramesRequested + "\n");
-                    w.write("captureFramesWritten=" + frames + "\n");
-
-                    w.write("sampleRateHz=" + audioSampleRateHz + "\n");
-                    w.write("trackGetSampleRateHz=" + debugAudioTrackSampleRate + "\n");
-
-                    w.write("outputSampleRateProperty=" + (debugOutputSampleRateProperty == null ? "" : debugOutputSampleRateProperty) + "\n");
-                    w.write("outputFramesPerBufferProperty=" + (debugOutputFramesPerBufferProperty == null ? "" : debugOutputFramesPerBufferProperty) + "\n");
-                    w.write("audioFramesPerWrite=" + debugAudioFramesPerWrite + "\n");
-                    w.write("audioWriteBlocking=" + (debugAudioWriteBlocking ? "true" : "false") + "\n");
-                    w.write("audioTrackBufferSizeInFrames=" + debugAudioTrackBufferSizeInFrames + "\n");
-
-                    w.write("javaUnderflowFrames=" + audioJavaUnderflowFrames + "\n");
-                    w.write("javaZeroPaddedFrames=" + audioJavaZeroPaddedFrames + "\n");
-                    w.write("javaWriteErrors=" + audioJavaWriteErrors + "\n");
-                }
-
-                ui.post(() -> Toast.makeText(this, "Audio WAV saved: " + wav, Toast.LENGTH_LONG).show());
-                Log.i(TAG, "WAV capture finished: " + wav);
-            } catch (Exception e) {
-                Log.e(TAG, "WAV finalize failed: " + e.getMessage());
-            }
-        }, "WavFinalize").start();
     }
 
     private void startAudioThread() {
@@ -867,41 +678,61 @@ public class GameActivity extends Activity {
 
             final int framesWanted = Math.max(audioFramesPerWrite, 256);
             short[] tmp = new short[framesWanted * 2];
+            final int pumpChunkFrames = Math.max(512, Math.min(4096, framesWanted * 2));
+            short[] pumpChunk = new short[pumpChunkFrames * 2];
 
-            long lastLogMs = 0;
+            // Allocate ~0.5s jitter buffer (at least 4 write-chunks).
+            audioJitterCapacityFrames = Math.max(framesWanted * 4, Math.max(4096, audioSampleRateHz / 2));
+            audioJitterPcm = new short[audioJitterCapacityFrames * 2];
+            audioJitterR = 0;
+            audioJitterW = 0;
             while (running) {
-                int frames = NativeBridge.nativePopAudio(tmp, framesWanted);
-                if (frames < 0) frames = 0;
-                if (frames < framesWanted) {
-                    audioJavaUnderflowFrames += (framesWanted - frames);
-                    audioJavaZeroPaddedFrames += (framesWanted - frames);
-                    int start = frames * 2;
-                    int end = framesWanted * 2;
-                    for (int i = start; i < end; i++) tmp[i] = 0;
+                // 1) Pump as much as we can from native into the jitter buffer (non-blocking).
+                // Native typically produces audio in bursts; this buffer smooths that.
+                for (int pumpIters = 0; pumpIters < 32 && running; pumpIters++) {
+                    int buffered = audioJitterW - audioJitterR;
+                    if (buffered < 0) buffered += audioJitterCapacityFrames;
+                    int free = audioJitterCapacityFrames - buffered;
+                    if (free < 64) break;
+
+                    int want = Math.min(pumpChunkFrames, free);
+                    int got = NativeBridge.nativePopAudio(pumpChunk, want);
+                    if (got < 0) got = 0;
+                    if (got == 0) break;
+
+                    int w = audioJitterW;
+                    for (int i = 0; i < got; i++) {
+                        int idx = (w + i);
+                        if (idx >= audioJitterCapacityFrames) idx -= audioJitterCapacityFrames;
+                        audioJitterPcm[idx * 2] = pumpChunk[i * 2];
+                        audioJitterPcm[idx * 2 + 1] = pumpChunk[i * 2 + 1];
+                    }
+                    w += got;
+                    if (w >= audioJitterCapacityFrames) w -= audioJitterCapacityFrames;
+                    audioJitterW = w;
                 }
 
-                // Capture EXACTLY what we are about to feed to AudioTrack.
-                if (debugCaptureActive && wavFramesRemaining > 0) {
-                    short[] pcm = debugCapturePcm;
-                    if (pcm != null) {
-                        int capFrames = (int) Math.min((long) framesWanted, wavFramesRemaining);
-                        int dstFrame = debugCaptureFramesWritten;
-                        int dstShort = dstFrame * 2;
-                        int srcShorts = capFrames * 2;
-                        if (dstShort + srcShorts <= pcm.length) {
-                            System.arraycopy(tmp, 0, pcm, dstShort, srcShorts);
-                            debugCaptureFramesWritten = dstFrame + capFrames;
-                            wavFramesRemaining -= capFrames;
-                            if (wavFramesRemaining <= 0) {
-                                finishWavCaptureAndWriteReport();
-                            }
-                        } else {
-                            // Shouldn't happen, but finalize safely.
-                            finishWavCaptureAndWriteReport();
-                        }
-                    } else {
-                        finishWavCaptureAndWriteReport();
-                    }
+                // 2) Produce exactly framesWanted for AudioTrack.
+                int available = audioJitterW - audioJitterR;
+                if (available < 0) available += audioJitterCapacityFrames;
+                int take = Math.min(framesWanted, available);
+
+                int r = audioJitterR;
+                for (int i = 0; i < take; i++) {
+                    int idx = r + i;
+                    if (idx >= audioJitterCapacityFrames) idx -= audioJitterCapacityFrames;
+                    tmp[i * 2] = audioJitterPcm[idx * 2];
+                    tmp[i * 2 + 1] = audioJitterPcm[idx * 2 + 1];
+                }
+                r += take;
+                if (r >= audioJitterCapacityFrames) r -= audioJitterCapacityFrames;
+                audioJitterR = r;
+
+                if (take < framesWanted) {
+                    int missing = framesWanted - take;
+                    int start = take * 2;
+                    int end = framesWanted * 2;
+                    for (int i = start; i < end; i++) tmp[i] = 0;
                 }
 
                 int off = 0;
@@ -918,29 +749,13 @@ public class GameActivity extends Activity {
                         n = audioTrack.write(tmp, off, remaining);
                     }
                     if (n <= 0) {
-                        audioJavaWriteErrors++;
                         try { Thread.sleep(2); } catch (InterruptedException ignored) {}
                         break;
                     }
                     off += n;
                     remaining -= n;
                 }
-
-                // Periodic log (Java-side only)
-                if (audioDebugCapture) {
-                    long now = System.currentTimeMillis();
-                    if (lastLogMs == 0) lastLogMs = now;
-                    if (now - lastLogMs >= 1000) {
-                        lastLogMs = now;
-                        Log.i(TAG, "audio stats: javaUnderTotal=" + audioJavaUnderflowFrames
-                                + " javaZeroPadTotal=" + audioJavaZeroPaddedFrames
-                                + " writeErr=" + audioJavaWriteErrors);
-                    }
-                }
             }
-
-            // If user quits early, still finalize the file.
-            if (debugCaptureActive) finishWavCaptureAndWriteReport();
         }, "AudioThread");
         audioThread.start();
     }

@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -457,8 +458,10 @@ static constexpr uint32_t kAudioCapacityFrames = 48000; // ~1s @48k
 // Keep buffered audio bounded to avoid perceived "audio lag".
 // If we get ahead (e.g., emulator catch-up frames), drop oldest samples.
 // Drop gradually to avoid audible "rubber-band" jumps.
-static std::atomic<uint32_t> g_audioMaxBufferedFrames{3072}; // default ~64ms @48k
-static std::atomic<uint32_t> g_audioMaxDropPerCallFrames{512}; // default ~10ms @48k
+// Default: no latency clamp (prioritize stable audio over minimum latency).
+// The ring buffer itself is ~1s, so this still won't grow unbounded.
+static std::atomic<uint32_t> g_audioMaxBufferedFrames{0};
+static std::atomic<uint32_t> g_audioMaxDropPerCallFrames{0};
 alignas(64) static int16_t g_audio[kAudioCapacityFrames * 2];
 static std::atomic<uint32_t> g_audioW{0};
 static std::atomic<uint32_t> g_audioR{0};
@@ -636,12 +639,18 @@ void loop60fps() {
     using clock = std::chrono::steady_clock;
     constexpr auto frame = std::chrono::microseconds(16667);
 
+    // Best-effort: prioritize emulation/audio production.
+    // (May be ignored by the OS depending on device/vendor restrictions.)
+    setpriority(PRIO_PROCESS, 0, -10);
+
     auto next = clock::now();
     while (g_running.load(std::memory_order_relaxed)) {
         const uint16_t localMask = g_inputMask.load(std::memory_order_relaxed);
 
         // Fixed-timestep loop with bounded catch-up.
-        constexpr int kMaxCatchUpFrames = 4;
+        // If this is too small and we ever miss our schedule (GC, I/O, CPU contention),
+        // we will under-produce audio and Java will start zero-padding.
+        constexpr int kMaxCatchUpFrames = 60;
         int steps = 0;
         auto now = clock::now();
         while (now >= next && steps < kMaxCatchUpFrames) {
@@ -681,12 +690,9 @@ void loop60fps() {
             now = clock::now();
         }
 
-        // If we're still behind after the bounded catch-up, resync the schedule.
-        // Without this, `next` can remain in the past forever and we will run frames as fast as possible,
-        // which overproduces audio and forces massive drops.
-        if (steps == kMaxCatchUpFrames && now >= next) {
-            next = now + frame;
-        }
+        // Do NOT resync `next` forward here.
+        // Resyncing effectively *skips emulated frames*, which directly causes audio underflows.
+        // If we're behind, we want to keep advancing frames until we catch up.
 
         if (steps > 0) {
             g_loopFramesTotal.fetch_add(static_cast<uint64_t>(steps), std::memory_order_relaxed);
@@ -902,6 +908,10 @@ extern "C" JNIEXPORT jint JNICALL
 Java_com_snesonline_NativeBridge_nativeGetAudioSampleRateHz(JNIEnv* /*env*/, jclass /*cls*/) {
     const double hz = snesonline::EmulatorEngine::instance().core().sampleRateHz();
     int out = static_cast<int>(hz + 0.5);
-    if (out < 8000 || out > 192000) out = 48000;
+    // IMPORTANT:
+    // Some cores don't report a valid sample rate until after the first frame.
+    // Returning 0 lets Java wait briefly and then configure AudioTrack correctly,
+    // avoiding large systematic underflows from a sample-rate mismatch.
+    if (out < 8000 || out > 192000) return 0;
     return static_cast<jint>(out);
 }

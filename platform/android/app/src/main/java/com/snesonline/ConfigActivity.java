@@ -46,7 +46,6 @@ public class ConfigActivity extends Activity {
     private static final String PREF_REMOTE_PORT = "remotePort";
 
     private static final String PREF_CONNECTION_CODE = "connectionCode";
-    private static final String PREF_AUDIO_DEBUG_CAPTURE = "audioDebugCapture";
 
     // Default bundled/downloadable core (arm64-v8a)
     private static final String DEFAULT_CORE_ASSET_PATH = "cores/snes9x_libretro_android.so";
@@ -55,7 +54,6 @@ public class ConfigActivity extends Activity {
     private EditText editRomPath;
     private Switch switchNetplay;
     private Switch switchOnscreenControls;
-    private Switch switchAudioDebugCapture;
     private EditText editLocalPort;
     private EditText editConnectionCode;
     private TextView txtStatus;
@@ -84,8 +82,6 @@ public class ConfigActivity extends Activity {
     private int resolvedRemotePort = 0;
 
     private String connectionCode = "";
-
-    private boolean audioDebugCapture = false;
 
     private enum ConnectionUiState {
         IDLE,
@@ -243,7 +239,6 @@ public class ConfigActivity extends Activity {
         editRomPath = findViewById(R.id.editRomPath);
         switchNetplay = findViewById(R.id.switchNetplay);
         switchOnscreenControls = findViewById(R.id.switchOnscreenControls);
-        switchAudioDebugCapture = findViewById(R.id.switchAudioDebugCapture);
         editLocalPort = findViewById(R.id.editLocalPort);
         editConnectionCode = findViewById(R.id.editConnectionCode);
         txtStatus = findViewById(R.id.txtStatus);
@@ -268,8 +263,6 @@ public class ConfigActivity extends Activity {
         showOnscreenControls = prefs.getBoolean(PREF_SHOW_ONSCREEN_CONTROLS, true);
         localPort = prefs.getInt(PREF_LOCAL_PORT, 7000);
 
-        audioDebugCapture = prefs.getBoolean(PREF_AUDIO_DEBUG_CAPTURE, false);
-
         netplayRole = prefs.getInt(PREF_NETPLAY_ROLE, 1);
         if (netplayRole != 1 && netplayRole != 2) netplayRole = 1;
         resolvedRemoteHost = prefs.getString(PREF_REMOTE_HOST, "");
@@ -279,12 +272,6 @@ public class ConfigActivity extends Activity {
 
         switchNetplay.setChecked(netplayEnabled);
         switchOnscreenControls.setChecked(showOnscreenControls);
-
-        switchAudioDebugCapture.setChecked(audioDebugCapture);
-        switchAudioDebugCapture.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            audioDebugCapture = isChecked;
-            prefs.edit().putBoolean(PREF_AUDIO_DEBUG_CAPTURE, audioDebugCapture).apply();
-        });
 
         editLocalPort.setText(String.valueOf(localPort));
 
@@ -360,7 +347,6 @@ public class ConfigActivity extends Activity {
                     .putBoolean(PREF_NETPLAY_ENABLED, netplayEnabled)
                     .putBoolean(PREF_SHOW_ONSCREEN_CONTROLS, showOnscreenControls)
                     .putInt(PREF_LOCAL_PORT, localPort)
-                    .putBoolean(PREF_AUDIO_DEBUG_CAPTURE, audioDebugCapture)
                     .apply();
 
             if (!netplayEnabled) {
@@ -370,7 +356,6 @@ public class ConfigActivity extends Activity {
                 i.putExtra("enableNetplay", false);
                 i.putExtra("showOnscreenControls", showOnscreenControls);
                 i.putExtra("localPort", localPort);
-                i.putExtra("audioDebugCapture", audioDebugCapture);
                 i.putExtra("remoteHost", "");
                 i.putExtra("remotePort", 0);
                 i.putExtra("localPlayerNum", 1);
@@ -395,7 +380,6 @@ public class ConfigActivity extends Activity {
                 i.putExtra("enableNetplay", true);
                 i.putExtra("showOnscreenControls", showOnscreenControls);
                 i.putExtra("localPort", localPort);
-                i.putExtra("audioDebugCapture", audioDebugCapture);
                 i.putExtra("remoteHost", "");
                 i.putExtra("remotePort", 0);
                 i.putExtra("localPlayerNum", 1);
@@ -427,7 +411,6 @@ public class ConfigActivity extends Activity {
             i.putExtra("enableNetplay", true);
             i.putExtra("showOnscreenControls", showOnscreenControls);
             i.putExtra("localPort", localPort);
-            i.putExtra("audioDebugCapture", audioDebugCapture);
             i.putExtra("remoteHost", savedHost);
             i.putExtra("remotePort", savedPort);
             i.putExtra("localPlayerNum", 2);

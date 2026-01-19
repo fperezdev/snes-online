@@ -3,6 +3,9 @@
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <WinSock2.h>
 #include <Windows.h>
 #include <commdlg.h>
@@ -18,8 +21,10 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "snesonline/AppConfig.h"
 #include "snesonline/EmulatorEngine.h"
@@ -828,6 +833,14 @@ struct AudioRing {
         readFrame.store(r + n, std::memory_order_release);
         return n;
     }
+
+    uint32_t bufferedFrames() const noexcept {
+        const uint32_t r = readFrame.load(std::memory_order_relaxed);
+        const uint32_t w = writeFrame.load(std::memory_order_acquire);
+        uint32_t avail = w - r;
+        if (avail > kCapacityFrames) avail = kCapacityFrames;
+        return avail;
+    }
 };
 
 static AudioRing g_audio;
@@ -841,10 +854,9 @@ static void sdlAudioCallback(void* /*userdata*/, Uint8* stream, int len) {
     std::memset(stream, 0, static_cast<size_t>(len));
     const uint32_t framesWanted = static_cast<uint32_t>(len / (sizeof(int16_t) * 2));
     auto* out = reinterpret_cast<int16_t*>(stream);
-    const uint32_t got = g_audio.pop(out, framesWanted);
+    (void)g_audio.pop(out, framesWanted);
 
     // Zero-fill remainder already done by memset.
-    (void)got;
 }
 
 struct VideoSinkCtx {
@@ -976,6 +988,7 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--config") == 0) { wantConfigOnly = true; continue; }
 
         if (std::strcmp(argv[i], "--netplay") == 0) { wantNetplay = true; continue; }
+
         if (std::strcmp(argv[i], "--player") == 0 && i + 1 < argc) {
             const int n = std::atoi(argv[++i]);
             localPlayerNum = static_cast<uint8_t>((n == 2) ? 2 : 1);
