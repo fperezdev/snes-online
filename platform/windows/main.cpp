@@ -1192,8 +1192,18 @@ int main(int argc, char** argv) {
 
         if (useLockstep) {
             // Android-compatible UDP lockstep.
-            if (autoDiscover && effectivePlayer != 1) {
-                std::fprintf(stderr, "Lockstep netplay requires Remote IP for Player 2.\n");
+            // Player 2 must have a configured remote endpoint.
+            if (effectivePlayer == 2 && (!effectiveIp || !effectiveIp[0] || effectiveRemotePort == 0)) {
+                std::fprintf(stderr, "Lockstep netplay requires remote IP/port for Player 2.\n");
+#if defined(_WIN32)
+                showMessageBox(
+                    "snes-online",
+                    "Lockstep netplay (Android-compatible) requires a Remote IP and Remote Port for Player 2.\n\n"
+                    "Use the Config dialog and either:\n"
+                    "  - Paste the connection code and click 'Join From Code', or\n"
+                    "  - Manually enter Remote IP + Remote Port.\n",
+                    MB_ICONERROR);
+#endif
                 return 2;
             }
 
@@ -1205,6 +1215,16 @@ int main(int argc, char** argv) {
 
             if (!lockstep.start(np)) {
                 std::fprintf(stderr, "Lockstep netplay failed to start.\n");
+#if defined(_WIN32)
+                showMessageBox(
+                    "snes-online",
+                    "Lockstep netplay failed to start.\n\n"
+                    "Common causes:\n"
+                    "  - Remote IP is not a valid IPv4 address\n"
+                    "  - Local port is already in use (try a different Local Port)\n"
+                    "  - Firewall is blocking UDP\n",
+                    MB_ICONERROR);
+#endif
                 return 1;
             }
 
@@ -1240,6 +1260,14 @@ int main(int argc, char** argv) {
 
             if (!netplay.start(np)) {
                 std::fprintf(stderr, "Netplay failed to start. Build with -DSNESONLINE_ENABLE_GGPO=ON (and ensure CMake finished fetching/building GGPO).\n");
+#if defined(_WIN32)
+                showMessageBox(
+                    "snes-online",
+                    "GGPO netplay failed to start.\n\n"
+                    "If you are connecting to Android, enable 'Android-compatible lockstep' in the Config dialog.\n\n"
+                    "Otherwise, ensure GGPO was built/enabled and your Remote IP/Port are valid.",
+                    MB_ICONERROR);
+#endif
                 return 1;
             }
 

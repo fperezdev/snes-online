@@ -28,6 +28,10 @@ public final class OnscreenControlsView extends View {
     private final RectF lRect = new RectF();
     private final RectF rRect = new RectF();
 
+    private float dpadCx = 0f;
+    private float dpadCy = 0f;
+    private float dpadRadius = 0f;
+
     private final HashMap<Integer, TouchBinding> pointerBindings = new HashMap<>();
 
     private enum BindingType {
@@ -79,9 +83,10 @@ public final class OnscreenControlsView extends View {
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
 
-        final float pad = Math.max(16f, Math.min(w, h) * 0.03f);
-        final float btn = Math.max(72f, Math.min(w, h) * 0.13f);
-        final float small = btn * 0.62f;
+        final float pad = Math.max(24f, Math.min(w, h) * 0.04f);
+        final float btnBase = Math.max(72f, Math.min(w, h) * 0.13f);
+        final float btn = btnBase * 1.8f; // ABXY size (+20%)
+        final float small = btnBase * 0.62f;
         final float topH = Math.max(54f, Math.min(w, h) * 0.08f);
 
         // L/R along the top.
@@ -89,17 +94,23 @@ public final class OnscreenControlsView extends View {
         rRect.set(w * 0.65f, pad, w - pad, pad + topH);
 
         // D-pad bottom-left.
-        float dSize = btn * 1.35f;
+        float dSize = (btnBase * 1.35f) * 1.8f; // +20%
         dpadRect.set(pad, h - pad - dSize, pad + dSize, h - pad);
+        dpadCx = dpadRect.centerX();
+        dpadCy = dpadRect.centerY();
+        dpadRadius = Math.min(dpadRect.width(), dpadRect.height()) * 0.5f;
 
         // Buttons bottom-right in a diamond.
-        float cx = w - pad - btn * 0.9f;
-        float cy = h - pad - btn * 0.9f;
+        // Keep the entire diamond inside (pad .. w-pad) and (pad .. h-pad)
+        final float diamondOffset = 0.65f; // more separation between buttons
+        final float diamondExtent = diamondOffset + 0.60f; // offset + button width factor
+        float cx = w - pad - btn * diamondExtent;
+        float cy = h - pad - btn * diamondExtent;
 
-        aRect.set(cx + btn * 0.55f, cy, cx + btn * 1.15f, cy + btn * 0.6f);
-        bRect.set(cx, cy + btn * 0.55f, cx + btn * 0.6f, cy + btn * 1.15f);
-        xRect.set(cx, cy - btn * 0.55f, cx + btn * 0.6f, cy + btn * 0.05f);
-        yRect.set(cx - btn * 0.55f, cy, cx + btn * 0.05f, cy + btn * 0.6f);
+        aRect.set(cx + btn * diamondOffset, cy, cx + btn * (diamondOffset + 0.60f), cy + btn * 0.60f);
+        bRect.set(cx, cy + btn * diamondOffset, cx + btn * 0.60f, cy + btn * (diamondOffset + 0.60f));
+        xRect.set(cx, cy - btn * diamondOffset, cx + btn * 0.60f, cy + btn * (0.60f - diamondOffset));
+        yRect.set(cx - btn * diamondOffset, cy, cx + btn * (0.60f - diamondOffset), cy + btn * 0.60f);
 
         // Start/Select center bottom.
         float midY = h - pad - small;
@@ -114,7 +125,7 @@ public final class OnscreenControlsView extends View {
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
 
-        drawButton(canvas, dpadRect, "D-PAD");
+        drawDpad(canvas);
         drawButton(canvas, aRect, "A");
         drawButton(canvas, bRect, "B");
         drawButton(canvas, xRect, "X");
@@ -123,6 +134,19 @@ public final class OnscreenControlsView extends View {
         drawButton(canvas, startRect, "START");
         drawButton(canvas, lRect, "L");
         drawButton(canvas, rRect, "R");
+    }
+
+    private void drawDpad(Canvas c) {
+        c.drawCircle(dpadCx, dpadCy, dpadRadius, bgPaint);
+        c.drawCircle(dpadCx, dpadCy, dpadRadius, fgPaint);
+        float y = dpadCy - (textPaint.descent() + textPaint.ascent()) * 0.5f;
+        c.drawText("D-PAD", dpadCx, y, textPaint);
+    }
+
+    private boolean isInDpad(float x, float y) {
+        float dx = x - dpadCx;
+        float dy = y - dpadCy;
+        return (dx * dx + dy * dy) <= (dpadRadius * dpadRadius);
     }
 
     private void drawButton(Canvas c, RectF r, String label) {
@@ -190,7 +214,7 @@ public final class OnscreenControlsView extends View {
     }
 
     private TouchBinding bindPointer(int pid, float x, float y) {
-        if (dpadRect.contains(x, y)) return new TouchBinding(BindingType.DPAD);
+        if (isInDpad(x, y)) return new TouchBinding(BindingType.DPAD);
         if (aRect.contains(x, y)) { pressKey(KeyEvent.KEYCODE_BUTTON_A); return new TouchBinding(BindingType.A); }
         if (bRect.contains(x, y)) { pressKey(KeyEvent.KEYCODE_BUTTON_B); return new TouchBinding(BindingType.B); }
         if (xRect.contains(x, y)) { pressKey(KeyEvent.KEYCODE_BUTTON_X); return new TouchBinding(BindingType.X); }

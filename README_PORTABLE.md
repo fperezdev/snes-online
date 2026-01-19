@@ -12,14 +12,14 @@ This opens the configuration window and saves settings to:
 
 Important fields:
 - **Local UDP Port**: your local UDP port (make sure your firewall allows it)
-- **Room Server URL**: URL of the room server (HTTP/HTTPS)
-- **Room Code**: 8–12 letters/numbers
-- **Room Password**: required
+- **Role**: Host (Player 1) or Join (Player 2)
+- **Remote IP/Port**: used when joining (Player 2)
+- **Connection Code**: share/paste to connect
 
-Netplay uses a **Room Code** flow:
+Netplay uses a **Connection Code** (Direct Connect via STUN):
+- Host clicks **Get Connection Info** to generate a Connection Code (copied to clipboard).
+- Join pastes it and clicks **Join From Code**.
 - Start the game on both devices.
-- The **first device to start** becomes **Player 1** automatically and registers its public UDP port.
-- The second device becomes **Player 2** and connects.
 
 ## 2) Put ROMs
 

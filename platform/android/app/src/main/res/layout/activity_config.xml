@@ -10,11 +10,6 @@
         android:padding="16dp">
 
         <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Core: Snes9x (bundled)" />
-
-        <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
@@ -43,6 +38,19 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
+            android:text="Audio" />
+
+        <Switch
+            android:id="@+id/switchAudioDebugCapture"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Audio debug capture (writes WAV to app storage)" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
             android:text="Netplay" />
 
         <Switch
@@ -50,33 +58,6 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="Enable Netplay" />
-
-        <LinearLayout
-            android:id="@+id/layoutRoom"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical">
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Room Code (optional)" />
-
-        <EditText
-            android:id="@+id/editRoomServerUrl"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="Room server URL (e.g. https://example.com)"
-            android:inputType="textUri" />
-
-        <EditText
-            android:id="@+id/editRoomPassword"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="Room password (required)"
-            android:inputType="textPassword" />
-
         <EditText
             android:id="@+id/editLocalPort"
             android:layout_width="match_parent"
@@ -84,15 +65,76 @@
             android:hint="Local UDP port (default 7000)"
             android:inputType="number" />
 
-        <EditText
-            android:id="@+id/editRoomCode"
+        <Button
+            android:id="@+id/btnStartConnection"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Room code (8-12 letters/numbers)" />
+            android:layout_marginTop="16dp"
+            android:text="Start connection" />
 
-        <!-- No connect button: connection occurs when pressing Start -->
+        <TextView
+            android:id="@+id/txtOr"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center_horizontal"
+            android:text="OR" />
+
+        <EditText
+            android:id="@+id/editConnectionCode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Connection code (paste from host)"
+            android:inputType="textMultiLine"
+            android:maxLines="4"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/btnJoinConnection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Join connection" />
+
+        <LinearLayout
+            android:id="@+id/hostWaitingRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/txtHostWaiting"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="" />
+
+            <ImageButton
+                android:id="@+id/btnCopyConnectionIcon"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_marginStart="6dp"
+                android:background="@android:color/transparent"
+                android:contentDescription="Copy connection code"
+                android:src="@drawable/ic_copy" />
 
         </LinearLayout>
+
+        <TextView
+            android:id="@+id/txtJoinTarget"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text=""
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/btnCancelConnection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Cancel"
+            android:visibility="gone" />
 
         <Button
             android:id="@+id/btnStart"
@@ -107,12 +149,6 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
             android:text="" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="Internet play tip: easiest is a VPN overlay (Tailscale/ZeroTier). Otherwise you need router port-forwarding for UDP." />
 
     </LinearLayout>
 

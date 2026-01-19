@@ -40,6 +40,9 @@ public final class NativeBridge {
     // Returns the best-effort public mapped UDP port for a socket bound to localPort (0 on failure).
     public static native int nativeStunPublicUdpPort(int localPort);
 
+    // Returns best-effort public mapped UDP address as "ip:port" for a socket bound to localPort ("" on failure).
+    public static native String nativeStunMappedAddress(int localPort);
+
     // Audio
     // Returns frames written into dst (dst length must be framesWanted*2)
     public static native int nativeGetAudioSampleRateHz();

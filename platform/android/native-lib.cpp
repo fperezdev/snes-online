@@ -462,6 +462,13 @@ static std::atomic<uint32_t> g_audioMaxDropPerCallFrames{512}; // default ~10ms 
 alignas(64) static int16_t g_audio[kAudioCapacityFrames * 2];
 static std::atomic<uint32_t> g_audioW{0};
 static std::atomic<uint32_t> g_audioR{0};
+static std::atomic<uint64_t> g_audioDroppedTotalFrames{0};
+static std::atomic<uint64_t> g_audioUnderflowTotalFrames{0};
+
+// Loop timing stats (diagnostics)
+static std::atomic<uint64_t> g_loopFramesTotal{0};
+static std::atomic<uint64_t> g_loopCatchupEventsTotal{0};
+static std::atomic<uint64_t> g_loopCatchupFramesTotal{0};
 
 static void configureAudioLatencyCaps(double sampleRateHz) noexcept {
     int sr = static_cast<int>(sampleRateHz + 0.5);
@@ -483,6 +490,34 @@ static void configureAudioLatencyCaps(double sampleRateHz) noexcept {
     g_audioMaxDropPerCallFrames.store(maxDrop, std::memory_order_relaxed);
 }
 
+static void setAudioLatencyCapsMs(int maxBufferedMs, int maxDropMs) noexcept {
+    // Convert ms -> frames using the core's current sample rate.
+    const double hz = snesonline::EmulatorEngine::instance().core().sampleRateHz();
+    int sr = static_cast<int>(hz + 0.5);
+    if (sr < 8000 || sr > 192000) sr = 48000;
+
+    uint32_t maxBufFrames = 0;
+    if (maxBufferedMs > 0) {
+        maxBufFrames = static_cast<uint32_t>((static_cast<uint64_t>(sr) * static_cast<uint64_t>(maxBufferedMs)) / 1000ULL);
+        if (maxBufFrames < 256) maxBufFrames = 256;
+        if (maxBufFrames > (kAudioCapacityFrames / 2)) maxBufFrames = (kAudioCapacityFrames / 2);
+    }
+
+    uint32_t maxDropFrames = 0;
+    if (maxDropMs > 0) {
+        maxDropFrames = static_cast<uint32_t>((static_cast<uint64_t>(sr) * static_cast<uint64_t>(maxDropMs)) / 1000ULL);
+        if (maxDropFrames < 64) maxDropFrames = 64;
+        if (maxDropFrames > 4096) maxDropFrames = 4096;
+    }
+
+    g_audioMaxBufferedFrames.store(maxBufFrames, std::memory_order_relaxed);
+    g_audioMaxDropPerCallFrames.store(maxDropFrames, std::memory_order_relaxed);
+
+    // Flush any stale buffered samples to prevent a "burst" after preset changes.
+    const uint32_t w = g_audioW.load(std::memory_order_acquire);
+    g_audioR.store(w, std::memory_order_release);
+}
+
 static std::size_t audioSink(void* /*ctx*/, const int16_t* stereoFrames, std::size_t frameCount) noexcept {
     if (!stereoFrames || frameCount == 0) return frameCount;
     uint32_t w = g_audioW.load(std::memory_order_relaxed);
@@ -496,6 +531,7 @@ static std::size_t audioSink(void* /*ctx*/, const int16_t* stereoFrames, std::si
         // Drop oldest.
         const uint32_t drop = frames - freeFrames;
         g_audioR.store(r + drop, std::memory_order_release);
+        g_audioDroppedTotalFrames.fetch_add(drop, std::memory_order_relaxed);
     }
 
     w = g_audioW.load(std::memory_order_relaxed);
@@ -516,8 +552,14 @@ static std::size_t audioSink(void* /*ctx*/, const int16_t* stereoFrames, std::si
         if (usedNow > kAudioCapacityFrames) usedNow = kAudioCapacityFrames;
         if (usedNow > maxBuffered) {
             uint32_t drop = usedNow - maxBuffered;
-            if (maxDropPerCall > 0 && drop > maxDropPerCall) drop = maxDropPerCall;
+            // If far beyond the target, hard-drop to the target immediately.
+            // This avoids a long period of tiny drops (audible repeated glitches).
+            const uint32_t hardDropThreshold = maxBuffered * 2;
+            if (usedNow <= hardDropThreshold && maxDropPerCall > 0 && drop > maxDropPerCall) {
+                drop = maxDropPerCall;
+            }
             g_audioR.store(curR + drop, std::memory_order_release);
+            g_audioDroppedTotalFrames.fetch_add(drop, std::memory_order_relaxed);
         }
     }
     return frameCount;
@@ -639,6 +681,21 @@ void loop60fps() {
             now = clock::now();
         }
 
+        // If we're still behind after the bounded catch-up, resync the schedule.
+        // Without this, `next` can remain in the past forever and we will run frames as fast as possible,
+        // which overproduces audio and forces massive drops.
+        if (steps == kMaxCatchUpFrames && now >= next) {
+            next = now + frame;
+        }
+
+        if (steps > 0) {
+            g_loopFramesTotal.fetch_add(static_cast<uint64_t>(steps), std::memory_order_relaxed);
+            if (steps > 1) {
+                g_loopCatchupEventsTotal.fetch_add(1, std::memory_order_relaxed);
+                g_loopCatchupFramesTotal.fetch_add(static_cast<uint64_t>(steps - 1), std::memory_order_relaxed);
+            }
+        }
+
         std::this_thread::sleep_until(next);
     }
 }
@@ -745,6 +802,19 @@ Java_com_snesonline_NativeBridge_nativeStunPublicUdpPort(JNIEnv* /*env*/, jclass
     return static_cast<jint>(mapped.port);
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_snesonline_NativeBridge_nativeStunMappedAddress(JNIEnv* env, jclass /*cls*/, jint localPort) {
+    const uint16_t lp = static_cast<uint16_t>((localPort >= 1 && localPort <= 65535) ? localPort : 0);
+    if (lp == 0) return env->NewStringUTF("");
+
+    snesonline::StunMappedAddress mapped;
+    if (!snesonline::stunDiscoverMappedAddressDefault(lp, mapped)) return env->NewStringUTF("");
+    if (mapped.ip.empty() || mapped.port < 1 || mapped.port > 65535) return env->NewStringUTF("");
+
+    const std::string s = mapped.ip + ":" + std::to_string(static_cast<unsigned>(mapped.port));
+    return env->NewStringUTF(s.c_str());
+}
+
 // Called by Activity/GL thread on MotionEvent.
 extern "C" JNIEXPORT void JNICALL
 Java_com_snesonline_NativeBridge_nativeOnAxis(JNIEnv* /*env*/, jclass /*cls*/, jfloat axisX, jfloat axisY) {
@@ -812,6 +882,9 @@ Java_com_snesonline_NativeBridge_nativePopAudio(JNIEnv* env, jclass /*cls*/, jsh
     if (avail > kAudioCapacityFrames) avail = kAudioCapacityFrames;
     uint32_t frames = static_cast<uint32_t>(framesWanted);
     if (frames > avail) frames = avail;
+    if (static_cast<uint32_t>(framesWanted) > frames) {
+        g_audioUnderflowTotalFrames.fetch_add(static_cast<uint64_t>(static_cast<uint32_t>(framesWanted) - frames), std::memory_order_relaxed);
+    }
 
     for (uint32_t i = 0; i < frames; ++i) {
         const uint32_t idx = (r + i) % kAudioCapacityFrames;

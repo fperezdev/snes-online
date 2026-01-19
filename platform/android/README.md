@@ -66,19 +66,21 @@ Do not commit the keystore or properties file (they are gitignored).
 - You pick a ROM via the system file picker.
 - The app copies the ROM into private app storage and starts **GameActivity**.
 
-## Netplay (Room Code, UDP lockstep)
+## Netplay (Direct Connect, UDP lockstep)
 
-Android uses a lightweight **UDP lockstep** exchange (no rollback). The recommended flow is **Room Code** rendezvous (no Direct IP UI).
+Android uses a lightweight **UDP lockstep** exchange (no rollback). The recommended flow is **Direct Connect** using a shareable **Connection Code**.
 
 In **ConfigActivity**, set:
-- **Room Server URL**
-- **Room Code** (8–12 letters/numbers)
-- **Room Password** (required)
 - **Local UDP Port** (default `7000`)
 
-At game start:
-- The first device to start becomes **Player 1** and discovers its public (NAT-mapped) UDP port via **STUN**.
-- The second device becomes **Player 2** and connects using the endpoint returned by the room server.
+Host (Player 1):
+- Tap **Get Connection Info (Host)** to discover the public UDP mapping via **STUN**.
+- Share the generated **Connection Code**.
+
+Join (Player 2):
+- Paste the code and tap **Join Connection**.
+
+Connection happens at game start and only exists while the game is running.
 
 ### Internet play
 

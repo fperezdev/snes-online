@@ -137,6 +137,8 @@ bool saveConfig(const std::string& path, const AppConfig& cfg) {
     f << "netplayEnabled=" << (cfg.netplayEnabled ? "true" : "false") << "\n";
     f << "netplayLockstep=" << (cfg.netplayLockstep ? "true" : "false") << "\n";
     f << "localPlayerNum=" << static_cast<int>(cfg.localPlayerNum == 2 ? 2 : 1) << "\n";
+    f << "remoteIp=" << cfg.remoteIp << "\n";
+    f << "remotePort=" << cfg.remotePort << "\n";
     f << "localPort=" << cfg.localPort << "\n\n";
 
     f << "[room]\n";

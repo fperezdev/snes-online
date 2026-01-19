@@ -12,8 +12,9 @@ struct AppConfig {
     bool netplayLockstep = false;
     // Must be 1 or 2.
     uint8_t localPlayerNum = 1;
-    std::string remoteIp = "127.0.0.1";
-    uint16_t remotePort = 7000;
+    // Empty -> host (Player 1) listens and auto-discovers the peer from the first UDP packet.
+    std::string remoteIp;
+    uint16_t remotePort = 0;
     uint16_t localPort = 7000;
 
     // Room server (optional): exchange IP/port by room code.

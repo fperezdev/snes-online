@@ -12,16 +12,14 @@ This opens the configuration window and saves settings to:
 
 Important fields:
 - Local UDP Port: your local UDP port (make sure your firewall allows it)
-- Room Server URL: URL of the room server (HTTP/HTTPS)
-- Room Code: 8-12 letters/numbers
-- Room Password: required
+- Role: Host (Player 1) or Join (Player 2)
+- Remote IP/Port: used when joining (Player 2)
+- Connection Code: share/paste to connect
 
-How netplay works (Room Code):
+How netplay works (Direct Connect / Connection Code):
 - Netplay connects at game start and only exists while the game is running.
-- The first device to start becomes Player 1 automatically (host).
-- The second device becomes Player 2 automatically (client).
-- Player 1 registers its public UDP port via a server-assisted WHOAMI punch.
-- Player 2 fetches the host endpoint from the room server and connects.
+- Host clicks "Get Connection Info" to generate a Connection Code (copied to clipboard).
+- Join pastes the code and clicks "Join From Code".
 
 2) ROMs folder
 
@@ -46,7 +44,7 @@ Optional netplay:
 If "Enable netplay" is checked in the configuration, snesonline_win.exe will automatically start in netplay mode.
 
 Netplay protocol note:
-- Room Code netplay uses peer-to-peer UDP lockstep (cross-platform).
+- Direct Connect netplay uses peer-to-peer UDP lockstep (cross-platform).
 - A Windows-only GGPO (rollback) mode exists but is separate/experimental.
 
 Command line overrides:
@@ -71,8 +69,8 @@ A) Recommended: VPN overlay (Tailscale / ZeroTier)
 B) Manual port-forwarding (router)
   - Works without VPN, but requires access to the host router.
 
-Room Code note:
-- Room Code is matchmaking only (not a relay). The actual game traffic is still peer-to-peer UDP.
+Direct Connect note:
+- This is not a relay. The actual game traffic is still peer-to-peer UDP.
 
 ----------------------------------------
 A) Step-by-step: VPN overlay (recommended)
@@ -91,9 +89,8 @@ A) Step-by-step: VPN overlay (recommended)
 4) Configure both devices using snesonline_config.exe
   - Enable netplay: ON
   - Local UDP Port: 7000
-  - Room Server URL: (use your server)
-  - Room Code: (shared)
-  - Room Password: (shared)
+  - Host: click Get Connection Info and share the Connection Code
+  - Join: paste the Connection Code and click Join From Code
 
 6) Allow firewall prompts
   - On first run, Windows may ask to allow network access.
@@ -136,15 +133,14 @@ Safety / best practices (recommended):
   - If Windows prompts, allow it.
 
 4) (Optional) Find the host Public IP (debugging)
-  - Not needed for Room Code netplay. The room server provides the public endpoint to the other player.
+  - Not needed for normal use. The Host's Connection Code already contains the host endpoint.
   - If you need it for debugging, use a "what is my IP" website or your router WAN status.
 
 5) Configure both devices using snesonline_config.exe
   - Enable netplay: ON
   - Local UDP Port: 7000
-  - Room Server URL: (use your server)
-  - Room Code: (shared)
-  - Room Password: (shared)
+  - Host: click Get Connection Info and share the Connection Code
+  - Join: paste the Connection Code and click Join From Code
 
 Important note (peer-to-peer UDP):
 - For reliable internet play without a VPN, it often works best if BOTH players can accept inbound UDP (port-forward on both routers).
@@ -160,7 +156,7 @@ Troubleshooting checklist (internet play)
 
 If it won't connect:
 - Use VPN overlay (Tailscale/ZeroTier) first; it avoids most NAT problems.
-- Confirm both sides use the same Room Code and Room Password.
+- Confirm the Join side pasted the correct Connection Code.
 - Confirm both sides are using the same ROM + same core.
 - If using port-forwarding:
   - Confirm the port-forward is UDP (not TCP).

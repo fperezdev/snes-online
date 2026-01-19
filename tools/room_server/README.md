@@ -1,4 +1,10 @@
-# Room code rendezvous server (runs on your PC)
+# Room code rendezvous server (legacy / optional)
+
+This server is **no longer required** for netplay in the default configuration.
+
+Netplay now supports a **Direct Connect** flow where Player 1 generates a shareable **Connection Code** using STUN and Player 2 pastes it to join.
+
+Keep using this room server only if you want the older room-code rendezvous workflow.
 
 This is a tiny HTTP + UDP helper that lets two players rendezvous using a short code (8–12 chars, letters+numbers).
 

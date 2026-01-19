@@ -94,41 +94,42 @@ Release run (from the repo root):
 .\build_vs\platform\windows\Release\snesonline_win.exe --core .\cores\snes9x_libretro.dll --rom C:\path\to\game.sfc
 ```
 
-## Netplay (Room Code, cross-platform)
+## Netplay (Direct Connect via Connection Code, cross-platform)
 
-This project supports **peer-to-peer UDP lockstep netplay** using a **Room Code** server for rendezvous.
+This project supports **peer-to-peer UDP lockstep netplay** using a **Connection Code** (no room server required).
 
 Key points:
-- Room Code netplay is **room-only** (no Direct IP UI).
-- A **room password is required**.
 - The connection is established **at game start** and only exists while the game is running.
-- The **first device to start the game** becomes **Player 1** (host) and discovers its public (NAT-mapped) UDP port via **STUN**.
-- The second device becomes **Player 2** and connects using the host endpoint returned by the room server.
+- Player 1 (host) uses **STUN** to discover its public (NAT-mapped) UDP endpoint and generates a **Connection Code** to share.
+- Player 2 (join) pastes the code to connect.
 - This is still P2P UDP (not a relay). Hard NAT / CGNAT may still require a VPN overlay.
 
 LAN optimization:
-- If both players are behind the same public IP (same NAT), the server may return a best-effort `room.localIp` so the client can prefer LAN routing.
+- If both players are behind the same public IP (same NAT), the Connection Code can include a best-effort LAN IPv4 so the joiner can prefer LAN routing.
 
 ### Windows (portable/desktop)
 1) Open the configuration UI (`--config` or `F1`).
 2) Set:
 	- **Local UDP Port** (default 7000)
-	- **Room Server URL** (default: `https://snes-online-1hgm.onrender.com`)
-	- **Room Code** (8–12 letters/numbers)
-	- **Room Password** (required)
-3) Start the game on both devices. The first starter becomes Player 1 automatically.
+	- Choose **Host** or **Join**
+3) Host flow:
+	- Click **Get Connection Info** and share the generated **Connection Code**.
+4) Join flow:
+	- Paste the code and click **Join From Code**.
+5) Start the game on both devices.
 
 ### Android
-1) In the config screen set Room Server URL, Room Code, Room Password, and Local UDP Port.
-2) Tap **Start**. The app will connect to the room before gameplay begins.
+1) In the config screen set **Local UDP Port**.
+2) Host: tap **Get Connection Info (Host)**, share the Connection Code.
+3) Join: paste the Connection Code and tap **Join Connection**.
 
 ### Internet play notes
 - If you can’t connect (mobile networks / CGNAT), the usual fix is to use a VPN overlay like Tailscale/ZeroTier on both devices.
 - Ensure your firewall allows inbound UDP on your **Local UDP Port**.
 
-## Room server
+## Room server (legacy / optional)
 
-The room server is a small Node.js HTTP+UDP service used for matchmaking.
+The room server is a small Node.js HTTP service used for legacy room-code rendezvous.
 
 Run locally (from the repo root):
 ```powershell

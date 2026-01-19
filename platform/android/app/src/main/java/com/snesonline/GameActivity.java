@@ -12,10 +12,14 @@ import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.os.Build;
 import android.os.Process;
+import android.util.Log;
 import android.view.InputDevice;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.View;
+import android.view.Window;
+import android.view.WindowManager;
 import android.widget.Toast;
 import android.widget.TextView;
 import android.widget.FrameLayout;
@@ -27,6 +31,9 @@ import android.view.SurfaceView;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.BufferedOutputStream;
+import java.io.FileWriter;
+import java.io.BufferedWriter;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.Inet4Address;
@@ -40,6 +47,7 @@ import java.nio.IntBuffer;
 import org.json.JSONObject;
 
 public class GameActivity extends Activity {
+    private static final String TAG = "SnesOnline";
     private SurfaceView surfaceView;
     private SurfaceHolder holder;
 
@@ -49,11 +57,46 @@ public class GameActivity extends Activity {
 
     private TextView waitingView;
 
+    private int directNetplayRole = 0; // 1=host, 2=join
+    private String directSelfEndpoint = ""; // best-effort public mapped ip:port
+    private String directTargetEndpoint = ""; // remote ip:port (from connection code)
+
     private volatile boolean running = false;
     private Thread audioThread;
 
     private AudioTrack audioTrack;
+    // Basic audio configuration (no presets)
+    private int audioSampleRateHz = 48000;
     private int audioFramesPerWrite = 1024;
+    private int audioBufferWriteMultiplier = 3;
+    private boolean audioWriteBlocking = true;
+
+    private boolean audioDebugCapture = false;
+    private int audioDebugSeconds = 12;
+    // Debug capture is intentionally designed to not touch disk in the audio thread.
+    // We buffer PCM in memory and write WAV/report on a background thread.
+    private volatile boolean debugCaptureActive = false;
+    private volatile long wavFramesRemaining = 0;
+    private volatile String wavPath = "";
+    private volatile short[] debugCapturePcm = null;
+    private volatile int debugCaptureFramesTarget = 0;
+    private volatile int debugCaptureFramesWritten = 0;
+
+    private long debugStartWallMs = 0;
+    private int debugCaptureSampleRate = 0;
+    private long debugCaptureFramesRequested = 0;
+
+    private String debugOutputSampleRateProperty = "";
+    private String debugOutputFramesPerBufferProperty = "";
+    private int debugAudioTrackSampleRate = 0;
+    private int debugAudioTrackBufferSizeInFrames = 0;
+    private int debugAudioFramesPerWrite = 0;
+    private boolean debugAudioWriteBlocking = true;
+    
+
+    private long audioJavaUnderflowFrames = 0;
+    private long audioJavaZeroPaddedFrames = 0;
+    private long audioJavaWriteErrors = 0;
 
     private static final int MAX_W = 512;
     private static final int MAX_H = 512;
@@ -76,9 +119,35 @@ public class GameActivity extends Activity {
     private static final String DEFAULT_CORE_FILENAME = "snes9x_libretro_android.so";
     private static final String DEFAULT_ROOM_SERVER_URL = "https://snes-online-1hgm.onrender.com";
 
+    private void applyImmersiveFullscreen() {
+        // Best-effort: hide title bar + status/navigation bars.
+        try {
+            if (getActionBar() != null) getActionBar().hide();
+        } catch (Exception ignored) {}
+
+        try {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        } catch (Exception ignored) {}
+
+        try {
+            final View decor = getWindow().getDecorView();
+            decor.setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+        } catch (Exception ignored) {}
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // Request no title before view creation.
+        try { requestWindowFeature(Window.FEATURE_NO_TITLE); } catch (Exception ignored) {}
         super.onCreate(savedInstanceState);
+
+        applyImmersiveFullscreen();
 
         surfaceView = new SurfaceView(this);
         surfaceView.setFocusable(true);
@@ -96,9 +165,11 @@ public class GameActivity extends Activity {
 
         boolean enableNetplay = getIntent().getBooleanExtra("enableNetplay", false);
         showOnscreenControls = getIntent().getBooleanExtra("showOnscreenControls", true);
+        audioDebugCapture = getIntent().getBooleanExtra("audioDebugCapture", false);
         String remoteHost = getIntent().getStringExtra("remoteHost");
-        int remotePort = getIntent().getIntExtra("remotePort", 7000);
+        int remotePort = getIntent().getIntExtra("remotePort", 0);
         int localPort = getIntent().getIntExtra("localPort", 7000);
+        int localPlayerNum = getIntent().getIntExtra("localPlayerNum", 0);
         String roomServerUrl = getIntent().getStringExtra("roomServerUrl");
         String roomCode = getIntent().getStringExtra("roomCode");
         String roomPassword = getIntent().getStringExtra("roomPassword");
@@ -109,9 +180,14 @@ public class GameActivity extends Activity {
         if (roomCode == null) roomCode = "";
         if (roomPassword == null) roomPassword = "";
 
+        if (audioDebugSeconds < 3) audioDebugSeconds = 3;
+        if (audioDebugSeconds > 30) audioDebugSeconds = 30;
+
         final String finalRomPath = romPath;
         final String finalCorePath = corePath;
         final int finalLocalPort = localPort;
+
+        applyImmersiveFullscreen();
 
         if (!enableNetplay) {
             // Non-netplay starts immediately.
@@ -136,7 +212,61 @@ public class GameActivity extends Activity {
             return;
         }
 
-        // Netplay: connect to room at game start. Session lifetime is tied to the game.
+        // Netplay: direct-connect (STUN) mode.
+        // - Player 1 starts with remoteHost="" and waits for the first packet.
+        // - Player 2 starts with remoteHost/remotePort from the connection code.
+        final int directRole = (localPlayerNum == 1 || localPlayerNum == 2) ? localPlayerNum : 0;
+        final boolean hasDirectTarget = (remoteHost != null && !remoteHost.isEmpty() && remotePort > 0 && remotePort <= 65535);
+        if (directRole != 0 && (directRole == 1 || hasDirectTarget)) {
+            directNetplayRole = directRole;
+            directTargetEndpoint = (hasDirectTarget ? (remoteHost + ":" + remotePort) : "");
+            directSelfEndpoint = "";
+            if (directRole == 1) {
+                // Show the public mapped endpoint the other device should send to.
+                try {
+                    String mapped = NativeBridge.nativeStunMappedAddress(finalLocalPort);
+                    if (mapped != null && mapped.contains(":")) {
+                        directSelfEndpoint = mapped.trim();
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+
+            final String initialMsg;
+            if (directRole == 1) {
+                String ep = (directSelfEndpoint != null && !directSelfEndpoint.isEmpty()) ? directSelfEndpoint : (":" + finalLocalPort);
+                initialMsg = "Waiting for peer to connect to your port " + ep;
+            } else {
+                String ep = (directTargetEndpoint != null && !directTargetEndpoint.isEmpty()) ? directTargetEndpoint : (remoteHost + ":" + remotePort);
+                initialMsg = "Waiting for peer to connect at " + ep;
+            }
+            waitingView.setText(initialMsg);
+            setContentView(waitingView);
+
+            try {
+                boolean ok = NativeBridge.nativeInitialize(
+                        finalCorePath,
+                        finalRomPath,
+                        true,
+                        (directRole == 2) ? remoteHost : "",
+                        (directRole == 2) ? remotePort : 0,
+                        finalLocalPort,
+                        directRole,
+                        "",
+                        "");
+                if (!ok) throw new Exception("Native init failed");
+
+                initVideo();
+                NativeBridge.nativeStartLoop();
+                ui.post(this::startWaitingLoop);
+            } catch (Exception e) {
+                Toast.makeText(this, "Netplay start failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                finish();
+            }
+            return;
+        }
+
+        // Netplay: legacy room-server rendezvous mode. Session lifetime is tied to the game.
         waitingView.setText("CONNECTING TO ROOM...\n\nPlease wait.");
         setContentView(waitingView);
 
@@ -151,7 +281,7 @@ public class GameActivity extends Activity {
 
                 final String resolvedRemoteHost = (r.role == 2) ? r.hostIp : "";
                 final int resolvedRemotePort = (r.role == 2) ? r.hostPort : 7000;
-                final int localPlayerNum = r.role;
+                final int resolvedLocalPlayerNum = r.role;
 
                 boolean ok = NativeBridge.nativeInitialize(
                         finalCorePath,
@@ -160,7 +290,7 @@ public class GameActivity extends Activity {
                         resolvedRemoteHost,
                         resolvedRemotePort,
                         finalLocalPort,
-                        localPlayerNum,
+                    resolvedLocalPlayerNum,
                         "",
                         "");
                 if (!ok) throw new Exception("Native init failed");
@@ -176,6 +306,12 @@ public class GameActivity extends Activity {
                 });
             }
         }, "RoomConnectAtStart").start();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) applyImmersiveFullscreen();
     }
 
     private void initVideo() {
@@ -399,9 +535,20 @@ public class GameActivity extends Activity {
                     return;
                 }
 
-                final String msg = (st == 1)
-                        ? "WAITING FOR PEER...\n\nStart the other device to connect."
-                        : "WAITING FOR INPUTS...\n\nConnecting...";
+                final String msg;
+                if (st == 1) {
+                    if (directNetplayRole == 1) {
+                        String ep = (directSelfEndpoint != null && !directSelfEndpoint.isEmpty()) ? directSelfEndpoint : "";
+                        msg = "Waiting for peer to connect to your port " + (ep.isEmpty() ? "" : ep);
+                    } else if (directNetplayRole == 2) {
+                        String ep = (directTargetEndpoint != null && !directTargetEndpoint.isEmpty()) ? directTargetEndpoint : "";
+                        msg = "Waiting for peer to connect at " + (ep.isEmpty() ? "" : ep);
+                    } else {
+                        msg = "Waiting for peer...";
+                    }
+                } else {
+                    msg = "WAITING FOR INPUTS...\n\nConnecting...";
+                }
                 waitingView.setText(msg);
                 ui.postDelayed(this, 100);
             }
@@ -489,41 +636,229 @@ public class GameActivity extends Activity {
     }
 
     private void setupAudio() {
-        // Match the libretro core's sample rate to avoid pitch/speed issues.
-        int sampleRate = NativeBridge.nativeGetAudioSampleRateHz();
-        if (sampleRate < 8000 || sampleRate > 192000) sampleRate = 48000;
+        audioSampleRateHz = NativeBridge.nativeGetAudioSampleRateHz();
+        if (audioSampleRateHz < 8000 || audioSampleRateHz > 192000) audioSampleRateHz = 48000;
+
+        // Optionally capture a short WAV of what we actually feed to AudioTrack.
+        if (audioDebugCapture) {
+            startWavCapture(audioSampleRateHz);
+        }
+
         final int channelMask = AudioFormat.CHANNEL_OUT_STEREO;
         final int format = AudioFormat.ENCODING_PCM_16BIT;
 
         // Stereo S16: 2 channels * 2 bytes
         final int frameBytes = 4;
 
-        int minBytes = AudioTrack.getMinBufferSize(sampleRate, channelMask, format);
+        int minBytes = AudioTrack.getMinBufferSize(audioSampleRateHz, channelMask, format);
         if (minBytes <= 0) minBytes = 4096;
 
         // Keep light headroom to reduce underruns with low latency.
         int minFrames = (minBytes + frameBytes - 1) / frameBytes;
-        audioFramesPerWrite = 512;
+
         if (audioFramesPerWrite < 256) audioFramesPerWrite = 256;
 
-        int targetFrames = Math.max(minFrames, audioFramesPerWrite * 3);
+        int mult = audioBufferWriteMultiplier;
+        if (mult < 2) mult = 2;
+        int targetFrames = Math.max(minFrames, audioFramesPerWrite * mult);
         int bufferBytes = targetFrames * frameBytes;
 
-        audioTrack = new AudioTrack(
-                new AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_GAME)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build(),
-                new AudioFormat.Builder()
-                        .setSampleRate(sampleRate)
-                        .setEncoding(format)
-                        .setChannelMask(channelMask)
-                        .build(),
+        AudioAttributes attrs = new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_GAME)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build();
+        AudioFormat fmt = new AudioFormat.Builder()
+            .setSampleRate(audioSampleRateHz)
+            .setEncoding(format)
+            .setChannelMask(channelMask)
+            .build();
+
+        if (Build.VERSION.SDK_INT >= 21) {
+            AudioTrack.Builder b = new AudioTrack.Builder()
+                .setAudioAttributes(attrs)
+                .setAudioFormat(fmt)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setBufferSizeInBytes(bufferBytes);
+            audioTrack = b.build();
+        } else {
+            audioTrack = new AudioTrack(
+                attrs,
+                fmt,
                 bufferBytes,
                 AudioTrack.MODE_STREAM,
                 AudioManager.AUDIO_SESSION_ID_GENERATE);
+        }
 
         audioTrack.play();
+
+        if (audioDebugCapture) {
+            try {
+                AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+                String osr = (am != null) ? am.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE) : "";
+                String fpb = (am != null) ? am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER) : "";
+                Log.i(TAG, "Audio debug enabled. sr=" + audioSampleRateHz
+                        + " trackGetSr=" + audioTrack.getSampleRate()
+                        + " outSr=" + osr
+                        + " framesPerBuffer=" + fpb
+                        + " trackBufferBytes=" + audioTrack.getBufferSizeInFrames() * 4);
+            } catch (Exception ignored) {
+            }
+        }
+
+        // Snapshot debug values for report file.
+        try {
+            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+            debugOutputSampleRateProperty = (am != null) ? String.valueOf(am.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)) : "";
+            debugOutputFramesPerBufferProperty = (am != null) ? String.valueOf(am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)) : "";
+        } catch (Exception ignored) {
+            debugOutputSampleRateProperty = "";
+            debugOutputFramesPerBufferProperty = "";
+        }
+        try {
+            debugAudioTrackSampleRate = audioTrack.getSampleRate();
+        } catch (Exception ignored) {
+            debugAudioTrackSampleRate = 0;
+        }
+        try {
+            debugAudioTrackBufferSizeInFrames = audioTrack.getBufferSizeInFrames();
+        } catch (Exception ignored) {
+            debugAudioTrackBufferSizeInFrames = 0;
+        }
+        debugAudioFramesPerWrite = audioFramesPerWrite;
+        debugAudioWriteBlocking = audioWriteBlocking;
+    }
+
+    private static void writeLE16(BufferedOutputStream out, int v) throws Exception {
+        out.write(v & 0xff);
+        out.write((v >>> 8) & 0xff);
+    }
+
+    private static void writeLE32(BufferedOutputStream out, int v) throws Exception {
+        out.write(v & 0xff);
+        out.write((v >>> 8) & 0xff);
+        out.write((v >>> 16) & 0xff);
+        out.write((v >>> 24) & 0xff);
+    }
+
+    private static void writeWavPcm16Stereo(File file, int sampleRate, short[] interleavedStereo, int frames) throws Exception {
+        // 44-byte PCM WAV header + interleaved stereo S16.
+        final long dataBytes = (long) frames * 4L;
+        final long riffSize = 36L + dataBytes;
+        try (BufferedOutputStream out = new BufferedOutputStream(new FileOutputStream(file, false), 256 * 1024)) {
+            out.write('R'); out.write('I'); out.write('F'); out.write('F');
+            writeLE32(out, (int) Math.min(riffSize, 0x7fffffffL));
+            out.write('W'); out.write('A'); out.write('V'); out.write('E');
+            out.write('f'); out.write('m'); out.write('t'); out.write(' ');
+            writeLE32(out, 16);
+            writeLE16(out, 1);
+            writeLE16(out, 2);
+            writeLE32(out, sampleRate);
+            int byteRate = sampleRate * 2 * 2;
+            writeLE32(out, byteRate);
+            writeLE16(out, 4);
+            writeLE16(out, 16);
+            out.write('d'); out.write('a'); out.write('t'); out.write('a');
+            writeLE32(out, (int) Math.min(dataBytes, 0x7fffffffL));
+
+            int shorts = frames * 2;
+            byte[] buf = new byte[Math.min(64 * 1024, shorts * 2)];
+            int bi = 0;
+            for (int i = 0; i < shorts; i++) {
+                short s = interleavedStereo[i];
+                buf[bi++] = (byte) (s & 0xff);
+                buf[bi++] = (byte) ((s >>> 8) & 0xff);
+                if (bi >= buf.length) {
+                    out.write(buf, 0, bi);
+                    bi = 0;
+                }
+            }
+            if (bi > 0) out.write(buf, 0, bi);
+            out.flush();
+        }
+    }
+
+    private void startWavCapture(int sampleRate) {
+        try {
+            File dir = getExternalFilesDir(null);
+            if (dir == null) dir = getFilesDir();
+            if (dir != null) dir.mkdirs();
+
+            String name = "audio_capture_" + System.currentTimeMillis() + ".wav";
+            File out = new File(dir, name);
+            int targetFrames = (int) Math.min((long) Integer.MAX_VALUE / 2L, (long) sampleRate * (long) audioDebugSeconds);
+            if (targetFrames < 1) targetFrames = sampleRate;
+            debugCapturePcm = new short[targetFrames * 2];
+            debugCaptureFramesTarget = targetFrames;
+            debugCaptureFramesWritten = 0;
+            wavFramesRemaining = targetFrames;
+            wavPath = out.getAbsolutePath();
+            debugCaptureActive = true;
+
+            debugStartWallMs = System.currentTimeMillis();
+            debugCaptureSampleRate = sampleRate;
+            debugCaptureFramesRequested = (long) sampleRate * (long) audioDebugSeconds;
+
+            Log.i(TAG, "WAV capture started: " + wavPath);
+        } catch (Exception e) {
+            debugCaptureActive = false;
+            debugCapturePcm = null;
+            debugCaptureFramesTarget = 0;
+            debugCaptureFramesWritten = 0;
+            wavFramesRemaining = 0;
+            wavPath = "";
+            Log.e(TAG, "WAV capture failed: " + e.getMessage());
+        }
+    }
+
+    private void finishWavCaptureAndWriteReport() {
+        if (!debugCaptureActive) return;
+        debugCaptureActive = false;
+        wavFramesRemaining = 0;
+
+        final String wav = wavPath;
+        wavPath = "";
+
+        final short[] pcm = debugCapturePcm;
+        debugCapturePcm = null;
+        final int frames = Math.max(0, Math.min(debugCaptureFramesWritten, debugCaptureFramesTarget));
+        debugCaptureFramesTarget = 0;
+        debugCaptureFramesWritten = 0;
+
+        if (wav == null || wav.isEmpty() || pcm == null || frames <= 0) return;
+
+        new Thread(() -> {
+            try {
+                File wavFile = new File(wav);
+                writeWavPcm16Stereo(wavFile, debugCaptureSampleRate, pcm, frames);
+
+                File report = new File(wav + ".txt");
+                try (BufferedWriter w = new BufferedWriter(new FileWriter(report, false))) {
+                    w.write("captureSecondsTarget=" + audioDebugSeconds + "\n");
+                    w.write("captureWallMs=" + Math.max(0, System.currentTimeMillis() - debugStartWallMs) + "\n");
+                    w.write("captureSampleRate=" + debugCaptureSampleRate + "\n");
+                    w.write("captureFramesRequested=" + debugCaptureFramesRequested + "\n");
+                    w.write("captureFramesWritten=" + frames + "\n");
+
+                    w.write("sampleRateHz=" + audioSampleRateHz + "\n");
+                    w.write("trackGetSampleRateHz=" + debugAudioTrackSampleRate + "\n");
+
+                    w.write("outputSampleRateProperty=" + (debugOutputSampleRateProperty == null ? "" : debugOutputSampleRateProperty) + "\n");
+                    w.write("outputFramesPerBufferProperty=" + (debugOutputFramesPerBufferProperty == null ? "" : debugOutputFramesPerBufferProperty) + "\n");
+                    w.write("audioFramesPerWrite=" + debugAudioFramesPerWrite + "\n");
+                    w.write("audioWriteBlocking=" + (debugAudioWriteBlocking ? "true" : "false") + "\n");
+                    w.write("audioTrackBufferSizeInFrames=" + debugAudioTrackBufferSizeInFrames + "\n");
+
+                    w.write("javaUnderflowFrames=" + audioJavaUnderflowFrames + "\n");
+                    w.write("javaZeroPaddedFrames=" + audioJavaZeroPaddedFrames + "\n");
+                    w.write("javaWriteErrors=" + audioJavaWriteErrors + "\n");
+                }
+
+                ui.post(() -> Toast.makeText(this, "Audio WAV saved: " + wav, Toast.LENGTH_LONG).show());
+                Log.i(TAG, "WAV capture finished: " + wav);
+            } catch (Exception e) {
+                Log.e(TAG, "WAV finalize failed: " + e.getMessage());
+            }
+        }, "WavFinalize").start();
     }
 
     private void startAudioThread() {
@@ -531,38 +866,81 @@ public class GameActivity extends Activity {
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
 
             final int framesWanted = Math.max(audioFramesPerWrite, 256);
-            // framesWanted * 2 samples
             short[] tmp = new short[framesWanted * 2];
+
+            long lastLogMs = 0;
             while (running) {
                 int frames = NativeBridge.nativePopAudio(tmp, framesWanted);
                 if (frames < 0) frames = 0;
+                if (frames < framesWanted) {
+                    audioJavaUnderflowFrames += (framesWanted - frames);
+                    audioJavaZeroPaddedFrames += (framesWanted - frames);
+                    int start = frames * 2;
+                    int end = framesWanted * 2;
+                    for (int i = start; i < end; i++) tmp[i] = 0;
+                }
 
-                // Always write a full chunk. If we didn't get enough audio from native
-                // (common during timing hiccups/netplay stalls), zero-pad the remainder.
-                int samplesToWrite = frames * 2;
-                final int targetSamples = framesWanted * 2;
-                if (samplesToWrite < targetSamples) {
-                    for (int i = samplesToWrite; i < targetSamples; i++) tmp[i] = 0;
-                    samplesToWrite = targetSamples;
+                // Capture EXACTLY what we are about to feed to AudioTrack.
+                if (debugCaptureActive && wavFramesRemaining > 0) {
+                    short[] pcm = debugCapturePcm;
+                    if (pcm != null) {
+                        int capFrames = (int) Math.min((long) framesWanted, wavFramesRemaining);
+                        int dstFrame = debugCaptureFramesWritten;
+                        int dstShort = dstFrame * 2;
+                        int srcShorts = capFrames * 2;
+                        if (dstShort + srcShorts <= pcm.length) {
+                            System.arraycopy(tmp, 0, pcm, dstShort, srcShorts);
+                            debugCaptureFramesWritten = dstFrame + capFrames;
+                            wavFramesRemaining -= capFrames;
+                            if (wavFramesRemaining <= 0) {
+                                finishWavCaptureAndWriteReport();
+                            }
+                        } else {
+                            // Shouldn't happen, but finalize safely.
+                            finishWavCaptureAndWriteReport();
+                        }
+                    } else {
+                        finishWavCaptureAndWriteReport();
+                    }
                 }
 
                 int off = 0;
-                int remaining = samplesToWrite;
+                int remaining = framesWanted * 2;
                 while (remaining > 0 && running) {
                     int n;
                     if (Build.VERSION.SDK_INT >= 23) {
-                        n = audioTrack.write(tmp, off, remaining, AudioTrack.WRITE_BLOCKING);
+                        n = audioTrack.write(
+                                tmp,
+                                off,
+                                remaining,
+                                audioWriteBlocking ? AudioTrack.WRITE_BLOCKING : AudioTrack.WRITE_NON_BLOCKING);
                     } else {
                         n = audioTrack.write(tmp, off, remaining);
                     }
                     if (n <= 0) {
+                        audioJavaWriteErrors++;
                         try { Thread.sleep(2); } catch (InterruptedException ignored) {}
                         break;
                     }
                     off += n;
                     remaining -= n;
                 }
+
+                // Periodic log (Java-side only)
+                if (audioDebugCapture) {
+                    long now = System.currentTimeMillis();
+                    if (lastLogMs == 0) lastLogMs = now;
+                    if (now - lastLogMs >= 1000) {
+                        lastLogMs = now;
+                        Log.i(TAG, "audio stats: javaUnderTotal=" + audioJavaUnderflowFrames
+                                + " javaZeroPadTotal=" + audioJavaZeroPaddedFrames
+                                + " writeErr=" + audioJavaWriteErrors);
+                    }
+                }
             }
+
+            // If user quits early, still finalize the file.
+            if (debugCaptureActive) finishWavCaptureAndWriteReport();
         }, "AudioThread");
         audioThread.start();
     }
@@ -596,7 +974,20 @@ public class GameActivity extends Activity {
         try {
             c.drawColor(Color.BLACK);
             Rect src = new Rect(0, 0, Math.min(w, MAX_W), Math.min(h, MAX_H));
-            Rect dst = new Rect(0, 0, c.getWidth(), c.getHeight());
+            int cw = c.getWidth();
+            int ch = c.getHeight();
+            if (cw <= 0 || ch <= 0) return;
+
+            // Fit the emulated frame inside the screen while preserving aspect ratio.
+            float sx = cw / (float) w;
+            float sy = ch / (float) h;
+            float s = Math.min(sx, sy);
+
+            int dw = Math.max(1, Math.round(w * s));
+            int dh = Math.max(1, Math.round(h * s));
+            int left = (cw - dw) / 2;
+            int top = (ch - dh) / 2;
+            Rect dst = new Rect(left, top, left + dw, top + dh);
             c.drawBitmap(bitmap, src, dst, blitPaint);
         } finally {
             holder.unlockCanvasAndPost(c);

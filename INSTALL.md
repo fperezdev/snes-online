@@ -29,7 +29,7 @@ Pop-Location
 ```
 
 Portable netplay note:
-- Netplay configuration is room-only (Room Server URL + Room Code + Room Password + Local UDP Port).
+- Netplay configuration uses Direct Connect via STUN (Host/Join + Connection Code + Local UDP Port).
 - Connection happens at game start and only exists while the game is running.
 
 The ZIP is typically created in:
