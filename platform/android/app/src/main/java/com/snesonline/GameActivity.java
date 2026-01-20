@@ -1,6 +1,11 @@
 package com.snesonline;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.graphics.Typeface;
+import android.widget.ArrayAdapter;
+import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -86,6 +91,16 @@ public class GameActivity extends Activity {
 
     private boolean gameplayStarted = false;
 
+    private boolean showingSlotDialog = false;
+    private boolean pendingNetplayUnpause = false;
+
+    private boolean enableNetplayIntent = false;
+    private int localPlayerNumIntent = 1;
+    private String statePathIntent = "";
+
+    private String romPathIntent = "";
+    private boolean showSaveButtonIntent = false;
+
     // Some controllers (incl. DualShock 4) report L2/R2 as axes, not keys.
     private boolean l2Down = false;
     private boolean r2Down = false;
@@ -139,6 +154,8 @@ public class GameActivity extends Activity {
 
         String corePath = ensureBundledCoreReady();
         String romPath = getIntent().getStringExtra("romPath");
+        String statePath = getIntent().getStringExtra("statePath");
+        String savePath = getIntent().getStringExtra("savePath");
 
         boolean enableNetplay = getIntent().getBooleanExtra("enableNetplay", false);
         showOnscreenControls = getIntent().getBooleanExtra("showOnscreenControls", true);
@@ -151,13 +168,23 @@ public class GameActivity extends Activity {
         String roomPassword = getIntent().getStringExtra("roomPassword");
 
         if (romPath == null) romPath = "";
+        if (statePath == null) statePath = "";
+        if (savePath == null) savePath = "";
         if (remoteHost == null) remoteHost = "";
         if (roomServerUrl == null) roomServerUrl = "";
         if (roomCode == null) roomCode = "";
         if (roomPassword == null) roomPassword = "";
 
+        enableNetplayIntent = enableNetplay;
+        localPlayerNumIntent = (localPlayerNum == 2) ? 2 : 1;
+        statePathIntent = statePath;
+        romPathIntent = romPath;
+        showSaveButtonIntent = getIntent().getBooleanExtra("showSaveButton", false);
+
         final String finalRomPath = romPath;
         final String finalCorePath = corePath;
+        final String finalStatePath = statePath;
+        final String finalSavePath = savePath;
         final int finalLocalPort = localPort;
 
         applyImmersiveFullscreen();
@@ -167,6 +194,8 @@ public class GameActivity extends Activity {
             boolean ok = NativeBridge.nativeInitialize(
                     finalCorePath,
                     finalRomPath,
+                    finalStatePath,
+                    finalSavePath,
                     false,
                     remoteHost,
                     remotePort,
@@ -220,6 +249,8 @@ public class GameActivity extends Activity {
                 boolean ok = NativeBridge.nativeInitialize(
                         finalCorePath,
                         finalRomPath,
+                        finalStatePath,
+                    finalSavePath,
                         true,
                         (directRole == 2) ? remoteHost : "",
                         (directRole == 2) ? remotePort : 0,
@@ -259,11 +290,13 @@ public class GameActivity extends Activity {
                 boolean ok = NativeBridge.nativeInitialize(
                         finalCorePath,
                         finalRomPath,
+                        finalStatePath,
+                    finalSavePath,
                         true,
                         resolvedRemoteHost,
                         resolvedRemotePort,
                         finalLocalPort,
-                    resolvedLocalPlayerNum,
+                        resolvedLocalPlayerNum,
                         "",
                         "");
                 if (!ok) throw new Exception("Native init failed");
@@ -509,7 +542,9 @@ public class GameActivity extends Activity {
                 }
 
                 final String msg;
-                if (st == 1) {
+                if (st == 4) {
+                    msg = "SYNCING SAVE STATE...\n\nPlease wait.";
+                } else if (st == 1) {
                     if (directNetplayRole == 1) {
                         String ep = (directSelfEndpoint != null && !directSelfEndpoint.isEmpty()) ? directSelfEndpoint : "";
                         msg = "Waiting for peer to connect to your port " + (ep.isEmpty() ? "" : ep);
@@ -542,6 +577,11 @@ public class GameActivity extends Activity {
                 onscreenControls = new OnscreenControlsView(this);
                 onscreenControls.setClickable(true);
                 onscreenControls.setFocusable(false);
+
+                // Host-only rule (netplay): only host can save/load.
+                final boolean canUseSaveLoad = showSaveButtonIntent && (!enableNetplayIntent || localPlayerNumIntent == 1);
+                onscreenControls.setShowStateButton(canUseSaveLoad);
+                onscreenControls.setOnStateRequested(() -> ui.post(this::showStateDialog));
                 gameRoot.addView(onscreenControls, new FrameLayout.LayoutParams(
                         FrameLayout.LayoutParams.MATCH_PARENT,
                         FrameLayout.LayoutParams.MATCH_PARENT));
@@ -937,5 +977,238 @@ public class GameActivity extends Activity {
         }
 
         super.onDestroy();
+    }
+
+    private static String baseNameNoExt(String path) {
+        if (path == null) return "";
+        try {
+            String name = new File(path).getName();
+            int dot = name.lastIndexOf('.');
+            if (dot > 0) name = name.substring(0, dot);
+            name = name.trim();
+            return name;
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private static String sanitizeSimpleBase(String base) {
+        if (base == null) return "";
+        String s = base.trim();
+        if (s.isEmpty()) return "";
+        s = s.replace("/", "_").replace("\\\\", "_");
+        if (s.length() > 60) s = s.substring(0, 60);
+        return s;
+    }
+
+    private File slotFileForRom(int slotIndex1Based) {
+        String base = sanitizeSimpleBase(baseNameNoExt(romPathIntent));
+        if (base.isEmpty()) base = "game";
+        File dir = new File(getFilesDir(), "states");
+        dir.mkdirs();
+        return new File(dir, base + "_slot" + slotIndex1Based + ".state");
+    }
+
+    private void showStateDialog() {
+        if (showingSlotDialog) return;
+
+        // Netplay rule: only host can create/load the canonical savestate.
+        if (enableNetplayIntent && localPlayerNumIntent != 1) {
+            Toast.makeText(this, "Only the host can save/load.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        showingSlotDialog = true;
+        pendingNetplayUnpause = false;
+        NativeBridge.nativeSetPaused(true);
+
+        final File[] slots = new File[5];
+        for (int i = 0; i < 5; i++) slots[i] = slotFileForRom(i + 1);
+
+        final String[] saveLabels = new String[5];
+        final String[] loadLabels = new String[5];
+        final Runnable refreshLabels = () -> {
+            for (int i = 0; i < 5; i++) {
+                final int slot = i + 1;
+                File f = slots[i];
+                if (f != null && f.exists() && f.length() > 0) {
+                    String ts = String.valueOf(android.text.format.DateFormat.format("yyyy-MM-dd HH:mm", f.lastModified()));
+                    saveLabels[i] = "Slot " + slot + "  (" + ts + ")";
+                    loadLabels[i] = "Slot " + slot + "  (" + ts + ")";
+                } else {
+                    saveLabels[i] = "Slot " + slot;
+                    loadLabels[i] = "Slot " + slot + "  (empty)";
+                }
+            }
+        };
+        refreshLabels.run();
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.HORIZONTAL);
+        int pad = (int) (getResources().getDisplayMetrics().density * 16);
+        root.setPadding(pad, pad, pad, pad);
+        root.setBackgroundColor(UiStyle.stateDialogBackground());
+
+        final int listHeight = (int) (getResources().getDisplayMetrics().density * 260);
+
+        LinearLayout left = new LinearLayout(this);
+        left.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout right = new LinearLayout(this);
+        right.setOrientation(LinearLayout.VERTICAL);
+
+        TextView saveTitle = new TextView(this);
+        saveTitle.setText("SAVE");
+        saveTitle.setTextColor(UiStyle.saveHeader());
+        saveTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        saveTitle.setTextSize(18f);
+        saveTitle.setPadding(0, 0, 0, pad / 2);
+        saveTitle.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
+
+        TextView loadTitle = new TextView(this);
+        loadTitle.setText("LOAD");
+        loadTitle.setTextColor(UiStyle.loadHeader());
+        loadTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        loadTitle.setTextSize(18f);
+        loadTitle.setPadding(0, 0, 0, pad / 2);
+        loadTitle.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
+
+        ListView saveList = new ListView(this);
+        ListView loadList = new ListView(this);
+
+        saveList.setDividerHeight(1);
+        saveList.setDivider(new android.graphics.drawable.ColorDrawable(Color.argb(140, 255, 255, 255)));
+        loadList.setDividerHeight(1);
+        loadList.setDivider(new android.graphics.drawable.ColorDrawable(Color.argb(140, 255, 255, 255)));
+
+        // Keep backgrounds opaque so gameplay behind doesn't reduce readability.
+        saveList.setBackgroundColor(UiStyle.saveListBackground());
+        loadList.setBackgroundColor(UiStyle.loadListBackground());
+
+        saveList.setSelector(new android.graphics.drawable.ColorDrawable(Color.argb(140, 255, 255, 255)));
+        loadList.setSelector(new android.graphics.drawable.ColorDrawable(Color.argb(140, 255, 255, 255)));
+
+        ArrayAdapter<String> saveAdapter = new ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, saveLabels) {
+            @Override
+            public View getView(int position, View convertView, android.view.ViewGroup parent) {
+                View v = super.getView(position, convertView, parent);
+                if (v instanceof TextView) {
+                    TextView tv = (TextView) v;
+                    tv.setTextColor(Color.WHITE);
+                    tv.setTextSize(16f);
+                    tv.setPadding(pad / 2, pad / 3, pad / 2, pad / 3);
+                    tv.setBackgroundColor(Color.TRANSPARENT);
+                }
+                return v;
+            }
+        };
+        ArrayAdapter<String> loadAdapter = new ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, loadLabels) {
+            @Override
+            public View getView(int position, View convertView, android.view.ViewGroup parent) {
+                View v = super.getView(position, convertView, parent);
+                if (v instanceof TextView) {
+                    TextView tv = (TextView) v;
+                    tv.setTextColor(Color.WHITE);
+                    tv.setTextSize(16f);
+                    tv.setPadding(pad / 2, pad / 3, pad / 2, pad / 3);
+                    tv.setBackgroundColor(Color.TRANSPARENT);
+                }
+                return v;
+            }
+        };
+        saveList.setAdapter(saveAdapter);
+        loadList.setAdapter(loadAdapter);
+
+        saveList.setOnItemClickListener((parent, view, position, id) -> {
+            if (position < 0 || position >= slots.length) return;
+            File f = slots[position];
+            if (f == null) return;
+            boolean ok = NativeBridge.nativeSaveStateToFile(f.getAbsolutePath());
+            Toast.makeText(this, ok ? ("Saved: slot " + (position + 1)) : "Save failed", Toast.LENGTH_SHORT).show();
+            refreshLabels.run();
+            saveAdapter.notifyDataSetChanged();
+            loadAdapter.notifyDataSetChanged();
+        });
+
+        final AlertDialog[] dlgRef = new AlertDialog[1];
+
+        loadList.setOnItemClickListener((parent, view, position, id) -> {
+            if (position < 0 || position >= slots.length) return;
+            File f = slots[position];
+            if (f == null || !f.exists() || f.length() == 0) {
+                Toast.makeText(this, "Slot is empty", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            boolean ok = NativeBridge.nativeLoadStateFromFile(f.getAbsolutePath());
+            if (!ok) {
+                Toast.makeText(this, "Load failed", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            if (enableNetplayIntent) {
+                pendingNetplayUnpause = true;
+                Toast.makeText(this, "Syncing state...", Toast.LENGTH_SHORT).show();
+                if (dlgRef[0] != null) dlgRef[0].dismiss();
+                waitForNetplayReadyThenUnpause();
+            } else {
+                Toast.makeText(this, "Loaded: slot " + (position + 1), Toast.LENGTH_SHORT).show();
+                NativeBridge.nativeSetPaused(false);
+                if (dlgRef[0] != null) dlgRef[0].dismiss();
+            }
+        });
+
+        left.addView(saveTitle);
+        left.addView(saveList, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, listHeight));
+        right.addView(loadTitle);
+        right.addView(loadList, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, listHeight));
+
+        root.addView(left, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        View divider = new View(this);
+        LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams((int) (getResources().getDisplayMetrics().density * 2), LinearLayout.LayoutParams.MATCH_PARENT);
+        int divPad = (int) (getResources().getDisplayMetrics().density * 10);
+        divLp.setMargins(divPad, 0, divPad, 0);
+        divider.setLayoutParams(divLp);
+        divider.setBackgroundColor(UiStyle.dividerColor());
+        root.addView(divider);
+
+        root.addView(right, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        AlertDialog dlg = new AlertDialog.Builder(this)
+                .setTitle("STATE")
+                .setView(root)
+                .setNegativeButton("Close", (d, w) -> {
+                    // handled by onDismiss
+                })
+                .setOnDismissListener(d -> {
+                    showingSlotDialog = false;
+                    if (!pendingNetplayUnpause) {
+                        NativeBridge.nativeSetPaused(false);
+                    }
+                })
+                .create();
+        dlgRef[0] = dlg;
+        dlg.show();
+    }
+
+    private void waitForNetplayReadyThenUnpause() {
+        ui.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (isFinishing()) {
+                    NativeBridge.nativeSetPaused(false);
+                    pendingNetplayUnpause = false;
+                    return;
+                }
+                int st = NativeBridge.nativeGetNetplayStatus();
+                if (st == 3) {
+                    NativeBridge.nativeSetPaused(false);
+                    pendingNetplayUnpause = false;
+                    Toast.makeText(GameActivity.this, "State synced", Toast.LENGTH_SHORT).show();
+                } else {
+                    ui.postDelayed(this, 100);
+                }
+            }
+        }, 100);
     }
 }

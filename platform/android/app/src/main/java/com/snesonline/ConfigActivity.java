@@ -6,8 +6,10 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.res.ColorStateList;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
 import android.util.Base64;
 import android.view.View;
 import android.widget.Toast;
@@ -16,6 +18,8 @@ import android.widget.Button;
 import android.widget.ImageButton;
 import android.widget.EditText;
 import android.widget.TextView;
+import android.app.AlertDialog;
+import android.graphics.Color;
 
 import android.text.Editable;
 import android.text.TextWatcher;
@@ -39,6 +43,7 @@ public class ConfigActivity extends Activity {
     private static final String PREF_NETPLAY_ENABLED = "netplayEnabled";
     private static final String PREF_LOCAL_PORT = "localPort";
     private static final String PREF_SHOW_ONSCREEN_CONTROLS = "showOnscreenControls";
+    private static final String PREF_SHOW_SAVE_BUTTON = "showSaveButton";
 
     // 1 = host (Player 1), 2 = join (Player 2)
     private static final String PREF_NETPLAY_ROLE = "netplayRole";
@@ -54,12 +59,16 @@ public class ConfigActivity extends Activity {
     private EditText editRomPath;
     private Switch switchNetplay;
     private Switch switchOnscreenControls;
+    private Switch switchShowSaveButton;
+    private View configRoot;
     private EditText editLocalPort;
     private EditText editConnectionCode;
     private TextView txtStatus;
     private Button btnStart;
     private Button btnStartConnection;
     private Button btnJoinConnection;
+    private Button btnPickRom;
+
 
     private TextView txtOr;
     private TextView txtHostWaiting;
@@ -75,7 +84,9 @@ public class ConfigActivity extends Activity {
 
     private boolean netplayEnabled = false;
     private boolean showOnscreenControls = true;
+    private boolean showSaveButton = false;
     private int localPort = 7000;
+
 
     private int netplayRole = 1;
     private String resolvedRemoteHost = "";
@@ -236,14 +247,19 @@ public class ConfigActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_config);
 
+        setTitle("SNES ONLINE");
+
+        configRoot = findViewById(R.id.configRoot);
+
         editRomPath = findViewById(R.id.editRomPath);
         switchNetplay = findViewById(R.id.switchNetplay);
         switchOnscreenControls = findViewById(R.id.switchOnscreenControls);
+        switchShowSaveButton = findViewById(R.id.switchShowSaveButton);
         editLocalPort = findViewById(R.id.editLocalPort);
         editConnectionCode = findViewById(R.id.editConnectionCode);
         txtStatus = findViewById(R.id.txtStatus);
 
-        Button btnPickRom = findViewById(R.id.btnPickRom);
+        btnPickRom = findViewById(R.id.btnPickRom);
         btnStart = findViewById(R.id.btnStart);
         btnStartConnection = findViewById(R.id.btnStartConnection);
         btnJoinConnection = findViewById(R.id.btnJoinConnection);
@@ -261,6 +277,7 @@ public class ConfigActivity extends Activity {
 
         netplayEnabled = prefs.getBoolean(PREF_NETPLAY_ENABLED, false);
         showOnscreenControls = prefs.getBoolean(PREF_SHOW_ONSCREEN_CONTROLS, true);
+        showSaveButton = prefs.getBoolean(PREF_SHOW_SAVE_BUTTON, true);
         localPort = prefs.getInt(PREF_LOCAL_PORT, 7000);
 
         netplayRole = prefs.getInt(PREF_NETPLAY_ROLE, 1);
@@ -272,12 +289,17 @@ public class ConfigActivity extends Activity {
 
         switchNetplay.setChecked(netplayEnabled);
         switchOnscreenControls.setChecked(showOnscreenControls);
+        if (switchShowSaveButton != null) switchShowSaveButton.setChecked(showSaveButton);
+
+        applyConfigTheme();
 
         editLocalPort.setText(String.valueOf(localPort));
 
         if (connectionCode != null && !connectionCode.isEmpty()) editConnectionCode.setText(connectionCode);
 
-        btnPickRom.setOnClickListener(v -> pickFile(REQ_PICK_ROM));
+        if (btnPickRom != null) btnPickRom.setOnClickListener(v -> pickFile(REQ_PICK_ROM));
+
+        applyInteractiveTheme();
 
         editRomPath.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
@@ -324,6 +346,7 @@ public class ConfigActivity extends Activity {
 
             netplayEnabled = switchNetplay.isChecked();
             showOnscreenControls = switchOnscreenControls.isChecked();
+            showSaveButton = (switchShowSaveButton != null) && switchShowSaveButton.isChecked();
             localPort = parseIntOr(editLocalPort.getText().toString().trim(), 7000);
 
             if (!coreReady || corePath.isEmpty()) {
@@ -346,6 +369,7 @@ public class ConfigActivity extends Activity {
                     .putString(PREF_ROM_PATH, romPath)
                     .putBoolean(PREF_NETPLAY_ENABLED, netplayEnabled)
                     .putBoolean(PREF_SHOW_ONSCREEN_CONTROLS, showOnscreenControls)
+                    .putBoolean(PREF_SHOW_SAVE_BUTTON, showSaveButton)
                     .putInt(PREF_LOCAL_PORT, localPort)
                     .apply();
 
@@ -353,8 +377,11 @@ public class ConfigActivity extends Activity {
                 // Non-netplay starts immediately.
                 Intent i = new Intent(this, GameActivity.class);
                 i.putExtra("romPath", romPath);
+                i.putExtra("statePath", "");
+                i.putExtra("savePath", "");
                 i.putExtra("enableNetplay", false);
                 i.putExtra("showOnscreenControls", showOnscreenControls);
+                i.putExtra("showSaveButton", showSaveButton);
                 i.putExtra("localPort", localPort);
                 i.putExtra("remoteHost", "");
                 i.putExtra("remotePort", 0);
@@ -377,8 +404,11 @@ public class ConfigActivity extends Activity {
                 setStatus("Starting netplay as Host...");
                 Intent i = new Intent(this, GameActivity.class);
                 i.putExtra("romPath", romPath);
+                i.putExtra("statePath", "");
+                i.putExtra("savePath", "");
                 i.putExtra("enableNetplay", true);
                 i.putExtra("showOnscreenControls", showOnscreenControls);
+                i.putExtra("showSaveButton", showSaveButton);
                 i.putExtra("localPort", localPort);
                 i.putExtra("remoteHost", "");
                 i.putExtra("remotePort", 0);
@@ -408,8 +438,12 @@ public class ConfigActivity extends Activity {
             setStatus("Starting netplay as Join...");
             Intent i = new Intent(this, GameActivity.class);
             i.putExtra("romPath", romPath);
+            // Joiner state selection is ignored; only the host's state is used.
+            i.putExtra("statePath", "");
+            i.putExtra("savePath", "");
             i.putExtra("enableNetplay", true);
             i.putExtra("showOnscreenControls", showOnscreenControls);
+            i.putExtra("showSaveButton", showSaveButton);
             i.putExtra("localPort", localPort);
             i.putExtra("remoteHost", savedHost);
             i.putExtra("remotePort", savedPort);
@@ -561,10 +595,108 @@ public class ConfigActivity extends Activity {
         });
     }
 
+    private void applyConfigTheme() {
+        if (configRoot != null) {
+            configRoot.setBackgroundColor(UiStyle.configBackground());
+        }
+
+        int text = UiStyle.configText();
+        int hint = Color.argb(160, Color.red(text), Color.green(text), Color.blue(text));
+
+        if (configRoot instanceof android.view.ViewGroup) {
+            applyTextThemeRecursive((android.view.ViewGroup) configRoot, text, hint);
+        }
+
+        if (txtStatus != null) {
+            txtStatus.setTextColor(text);
+        }
+    }
+
+    private void applyTextThemeRecursive(android.view.ViewGroup root, int textColor, int hintColor) {
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View v = root.getChildAt(i);
+            if (v instanceof android.view.ViewGroup) {
+                applyTextThemeRecursive((android.view.ViewGroup) v, textColor, hintColor);
+            }
+            if (v instanceof TextView) {
+                ((TextView) v).setTextColor(textColor);
+            }
+            if (v instanceof EditText) {
+                ((EditText) v).setHintTextColor(hintColor);
+            }
+        }
+    }
+
+    private void applyInteractiveTheme() {
+        applyButtonTheme(btnPickRom);
+        applyButtonTheme(btnStart);
+        applyButtonTheme(btnStartConnection);
+        applyButtonTheme(btnJoinConnection);
+        applyButtonTheme(btnCancelConnection);
+
+        applySwitchTheme(switchNetplay);
+        applySwitchTheme(switchOnscreenControls);
+        applySwitchTheme(switchShowSaveButton);
+    }
+
+    private void applyButtonTheme(Button b) {
+        if (b == null) return;
+        final int enabledBg = UiStyle.ACCENT_2;      // dark purple
+        // Slightly lighter than PRIMARY_BASE for a more "disabled" feel.
+        final int disabledBg = 0xFFE6E3E5;
+        // Enabled buttons should read clearly.
+        final int enabledText = 0xFFFFFFFF;
+        // Disabled text should match the previous disabled background color.
+        final int disabledText = UiStyle.PRIMARY_BASE;
+
+        boolean en = b.isEnabled();
+        b.setTextColor(en ? enabledText : disabledText);
+
+        try {
+            if (Build.VERSION.SDK_INT >= 21) {
+                int[][] states = new int[][]{
+                        new int[]{android.R.attr.state_enabled},
+                        new int[]{-android.R.attr.state_enabled}
+                };
+                int[] colors = new int[]{enabledBg, disabledBg};
+                b.setBackgroundTintList(new ColorStateList(states, colors));
+            } else {
+                b.setBackgroundColor(en ? enabledBg : disabledBg);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void applySwitchTheme(Switch s) {
+        if (s == null) return;
+        try {
+            if (Build.VERSION.SDK_INT < 21) return;
+
+            final int checked = UiStyle.ACCENT_2;
+            final int unchecked = UiStyle.SECONDARY_BASE;
+
+            int[][] states = new int[][]{
+                    new int[]{android.R.attr.state_checked},
+                    new int[]{-android.R.attr.state_checked}
+            };
+
+            int[] thumb = new int[]{checked, unchecked};
+            s.setThumbTintList(new ColorStateList(states, thumb));
+
+            int checkedTrack = (checked & 0x00FFFFFF) | 0x66000000;
+            int uncheckedTrack = (unchecked & 0x00FFFFFF) | 0x55000000;
+            int[] track = new int[]{checkedTrack, uncheckedTrack};
+            s.setTrackTintList(new ColorStateList(states, track));
+        } catch (Exception ignored) {
+        }
+    }
+
     private void updateNetplayUi(boolean enabled) {
         netplayEnabled = enabled;
         btnStartConnection.setEnabled(enabled);
         btnJoinConnection.setEnabled(enabled);
+
+        applyInteractiveTheme();
 
         if (!enabled) {
             applyConnectionUiState(ConnectionUiState.IDLE);
@@ -589,6 +721,8 @@ public class ConfigActivity extends Activity {
         }
 
         if (btnStart != null) btnStart.setEnabled(enabled);
+
+        applyInteractiveTheme();
     }
 
     private void applyConnectionUiState(ConnectionUiState st) {
@@ -629,6 +763,8 @@ public class ConfigActivity extends Activity {
         if (btnCancelConnection != null) {
             btnCancelConnection.setVisibility(st == ConnectionUiState.IDLE ? View.GONE : View.VISIBLE);
         }
+
+        applyInteractiveTheme();
     }
 
     private static int parseIntOr(String s, int fallback) {
@@ -650,6 +786,61 @@ public class ConfigActivity extends Activity {
         startActivityForResult(i, requestCode);
     }
 
+
+    private static String sanitizeFilename(String name) {
+        if (name == null) return "";
+        String t = name.trim();
+        if (t.isEmpty()) return "";
+        // Remove path separators and other problematic characters.
+        t = t.replace("/", "_").replace("\\\\", "_");
+        t = t.replace(":", "_").replace("*", "_").replace("?", "_");
+        t = t.replace("\"", "_").replace("<", "_").replace(">", "_").replace("|", "_");
+        // Avoid extremely long filenames.
+        if (t.length() > 80) t = t.substring(0, 80);
+        return t;
+    }
+
+    private String displayNameFromUri(Uri uri) {
+        if (uri == null) return "";
+        try {
+            android.database.Cursor c = getContentResolver().query(uri, new String[]{android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null);
+            if (c != null) {
+                try {
+                    if (c.moveToFirst()) {
+                        int idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                        if (idx >= 0) {
+                            String name = c.getString(idx);
+                            return (name != null) ? name : "";
+                        }
+                    }
+                } finally {
+                    c.close();
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
+    }
+
+    private static File uniqueFile(File dir, String filename) {
+        if (dir == null) return null;
+        dir.mkdirs();
+        File f = new File(dir, filename);
+        if (!f.exists()) return f;
+        String base = filename;
+        String ext = "";
+        int dot = filename.lastIndexOf('.');
+        if (dot > 0 && dot + 1 < filename.length()) {
+            base = filename.substring(0, dot);
+            ext = filename.substring(dot);
+        }
+        for (int i = 2; i < 1000; i++) {
+            File g = new File(dir, base + "_" + i + ext);
+            if (!g.exists()) return g;
+        }
+        return f;
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
@@ -659,7 +850,10 @@ public class ConfigActivity extends Activity {
 
         try {
             if (requestCode == REQ_PICK_ROM) {
-                File dst = new File(getFilesDir(), "roms/rom.sfc");
+                String name = sanitizeFilename(displayNameFromUri(uri));
+                if (name.isEmpty()) name = "rom.sfc";
+                File dir = new File(getFilesDir(), "roms");
+                File dst = uniqueFile(dir, name);
                 String out = copyUriToPrivateFile(uri, dst);
                 editRomPath.setText(out);
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_ROM_PATH, out).apply();

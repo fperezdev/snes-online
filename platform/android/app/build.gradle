@@ -82,8 +82,27 @@ android {
 }
 
 dependencies {
-    // No external deps required for the minimal flow.
+    implementation 'com.caverock:androidsvg:1.4'
 }
+
+// Keep res/raw/dpad.svg in sync with the editable source file.
+tasks.register('syncDpadSvg') {
+    doLast {
+        def src = file('src/main/res/icons/dpad.svg')
+        if (!src.exists()) return
+
+        def dstDir = file('src/main/res/raw')
+        dstDir.mkdirs()
+
+        copy {
+            from(src)
+            into(dstDir)
+            rename { 'dpad.svg' }
+        }
+    }
+}
+
+preBuild.dependsOn(tasks.named('syncDpadSvg'))
 
 // --- Bundled libretro core(s) ---
 // We bundle a default SNES core into the APK assets at build time.

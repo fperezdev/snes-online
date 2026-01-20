@@ -12,6 +12,8 @@ public final class NativeBridge {
     public static native boolean nativeInitialize(
             String corePath,
             String romPath,
+            String statePath,
+            String savePath,
             boolean enableNetplay,
             String remoteHost,
             int remotePort,
@@ -24,6 +26,13 @@ public final class NativeBridge {
     public static native void nativeStartLoop();
     public static native void nativeStopLoop();
 
+    // Pause emulation (loop keeps running to allow netplay state sync).
+    public static native void nativeSetPaused(boolean paused);
+
+    // Save states
+    public static native boolean nativeSaveStateToFile(String statePath);
+    public static native boolean nativeLoadStateFromFile(String statePath);
+
     public static native void nativeOnAxis(float axisX, float axisY);
     public static native void nativeOnKey(int keyCode, int action);
 
@@ -33,7 +42,7 @@ public final class NativeBridge {
     public static native ByteBuffer nativeGetVideoBufferRGBA();
 
     // Netplay status
-    // 0=off, 1=connecting (no peer yet), 2=waiting (peer but missing inputs), 3=ok
+    // 0=off, 1=connecting (no peer yet), 2=waiting (peer but missing inputs), 3=ok, 4=syncing state
     public static native int nativeGetNetplayStatus();
 
     // Networking helpers

@@ -46,6 +46,11 @@ public:
     bool serialize(void* dst, std::size_t sizeBytes) const noexcept;
     bool unserialize(const void* src, std::size_t sizeBytes) noexcept;
 
+    // Optional libretro memory access (used for in-game/battery saves like SRAM).
+    // If the core does not export these, memoryData() returns nullptr and memorySize() returns 0.
+    void* memoryData(unsigned id) noexcept;
+    std::size_t memorySize(unsigned id) const noexcept;
+
     // Per-frame input feeding (SNES mask per port).
     // Port 0 = Player 1, Port 1 = Player 2.
     void setInputMask(unsigned port, uint16_t mask) noexcept;
@@ -79,6 +84,9 @@ private:
     void (*retro_set_video_refresh_)(void (*)(const void*, unsigned, unsigned, size_t)) = nullptr;
     void (*retro_set_audio_sample_)(void (*)(int16_t, int16_t)) = nullptr;
     void (*retro_set_audio_sample_batch_)(size_t (*)(const int16_t*, size_t)) = nullptr;
+
+    void* (*retro_get_memory_data_)(unsigned) = nullptr;
+    size_t (*retro_get_memory_size_)(unsigned) = nullptr;
 
 private:
     static void inputPoll_() noexcept;

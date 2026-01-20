@@ -9,6 +9,8 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
+#include <cstdio>
 
 #include "snesonline/EmulatorEngine.h"
 #include "snesonline/InputBits.h"
@@ -20,12 +22,207 @@
 #include <netdb.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <errno.h>
 
 namespace {
 
+static inline uint32_t read_u32_be_(const uint8_t* p) noexcept {
+    uint32_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return ntohl(v);
+}
+
+static inline uint16_t read_u16_be_(const uint8_t* p) noexcept {
+    uint16_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return ntohs(v);
+}
+
+static inline void write_u32_be_(uint8_t* p, uint32_t v) noexcept {
+    const uint32_t be = htonl(v);
+    std::memcpy(p, &be, sizeof(be));
+}
+
+static inline void write_u16_be_(uint8_t* p, uint16_t v) noexcept {
+    const uint16_t be = htons(v);
+    std::memcpy(p, &be, sizeof(be));
+}
+
+static uint32_t crc32_(const void* data, std::size_t sizeBytes) noexcept {
+    uint32_t crc = 0xFFFFFFFFu;
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (std::size_t i = 0; i < sizeBytes; ++i) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; ++k) {
+            const uint32_t mask = -(crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+static bool readFile_(const char* path, std::vector<uint8_t>& out) noexcept {
+    out.clear();
+    if (!path || !path[0]) return false;
+    std::FILE* f = std::fopen(path, "rb");
+    if (!f) return false;
+    if (std::fseek(f, 0, SEEK_END) != 0) {
+        std::fclose(f);
+        return false;
+    }
+    const long sz = std::ftell(f);
+    if (sz <= 0) {
+        std::fclose(f);
+        return false;
+    }
+    if (std::fseek(f, 0, SEEK_SET) != 0) {
+        std::fclose(f);
+        return false;
+    }
+
+    try {
+        out.resize(static_cast<std::size_t>(sz));
+    } catch (...) {
+        std::fclose(f);
+        out.clear();
+        return false;
+    }
+
+    const std::size_t n = std::fread(out.data(), 1, out.size(), f);
+    std::fclose(f);
+    if (n != out.size()) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+static bool writeFile_(const char* path, const void* data, std::size_t sizeBytes) noexcept {
+    if (!path || !path[0] || !data || sizeBytes == 0) return false;
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f) return false;
+    const std::size_t n = std::fwrite(data, 1, sizeBytes, f);
+    std::fclose(f);
+    return n == sizeBytes;
+}
+
+static bool loadStateBytes_(const uint8_t* data, std::size_t sizeBytes) noexcept {
+    if (!data || sizeBytes == 0) return false;
+    snesonline::SaveState st;
+    if (!st.buffer.allocate(sizeBytes)) return false;
+    std::memcpy(st.buffer.data(), data, sizeBytes);
+    st.sizeBytes = sizeBytes;
+    st.checksum = crc32_(data, sizeBytes);
+    return snesonline::EmulatorEngine::instance().loadState(st);
+}
+
+static bool ensureDir_(const std::string& dir) noexcept {
+    if (dir.empty()) return false;
+    if (::mkdir(dir.c_str(), 0755) == 0) return true;
+    return errno == EEXIST;
+}
+
+static std::string dirname_(const std::string& path) {
+    const auto slash = path.find_last_of('/');
+    if (slash == std::string::npos) return {};
+    if (slash == 0) return "/";
+    return path.substr(0, slash);
+}
+
+static std::string basenameNoExt_(const std::string& path) {
+    const auto slash = path.find_last_of('/');
+    std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    const auto dot = name.find_last_of('.');
+    if (dot != std::string::npos) name = name.substr(0, dot);
+    if (name.empty()) name = "game";
+    return name;
+}
+
+static std::string makeSaveRamPathFromRom_(const char* romPath) {
+    if (!romPath || !romPath[0]) return {};
+    std::string rom(romPath);
+    const std::string romDir = dirname_(rom);
+    const std::string rootDir = dirname_(romDir);
+    if (rootDir.empty()) return {};
+    const std::string saveDir = rootDir + "/saves";
+    (void)ensureDir_(saveDir);
+    return saveDir + "/" + basenameNoExt_(rom) + ".srm";
+}
+
+static constexpr unsigned kRetroMemorySaveRam_ = 0; // RETRO_MEMORY_SAVE_RAM
+
+static std::string g_saveRamPath;
+static bool g_saveRamLoadedFromFile = false;
+static bool g_saveRamLoadedExplicitly = false;
+static uint32_t g_saveRamLastCrc = 0;
+static std::chrono::steady_clock::time_point g_saveRamLastCheck{};
+static std::chrono::steady_clock::time_point g_saveRamLastFlush{};
+
+static bool applySaveRamBytes_(const uint8_t* data, std::size_t sizeBytes) noexcept {
+    auto& core = snesonline::EmulatorEngine::instance().core();
+    void* mem = core.memoryData(kRetroMemorySaveRam_);
+    const std::size_t memSize = core.memorySize(kRetroMemorySaveRam_);
+    if (!mem || memSize == 0) return false;
+    const std::size_t copyN = (sizeBytes < memSize) ? sizeBytes : memSize;
+    if (copyN > 0) std::memcpy(mem, data, copyN);
+    if (copyN < memSize) std::memset(static_cast<uint8_t*>(mem) + copyN, 0, memSize - copyN);
+    return true;
+}
+
+static bool loadSaveRamFromFile_(const std::string& path) noexcept {
+    g_saveRamLoadedFromFile = false;
+    if (path.empty()) return false;
+    std::vector<uint8_t> bytes;
+    if (!readFile_(path.c_str(), bytes)) return false;
+    if (!applySaveRamBytes_(bytes.data(), bytes.size())) return false;
+    g_saveRamLoadedFromFile = true;
+    return true;
+}
+
+static bool getSaveRamBytes_(std::vector<uint8_t>& out) noexcept {
+    out.clear();
+    auto& core = snesonline::EmulatorEngine::instance().core();
+    void* mem = core.memoryData(kRetroMemorySaveRam_);
+    const std::size_t memSize = core.memorySize(kRetroMemorySaveRam_);
+    if (!mem || memSize == 0) return false;
+    try {
+        out.resize(memSize);
+    } catch (...) {
+        out.clear();
+        return false;
+    }
+    std::memcpy(out.data(), mem, memSize);
+    return true;
+}
+
+static void maybeFlushSaveRam_(bool force) noexcept {
+    if (g_saveRamPath.empty()) return;
+    auto& core = snesonline::EmulatorEngine::instance().core();
+    void* mem = core.memoryData(kRetroMemorySaveRam_);
+    const std::size_t memSize = core.memorySize(kRetroMemorySaveRam_);
+    if (!mem || memSize == 0) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!force) {
+        if (g_saveRamLastCheck.time_since_epoch().count() != 0 && (now - g_saveRamLastCheck) < std::chrono::milliseconds(500)) return;
+        g_saveRamLastCheck = now;
+    }
+
+    const uint32_t crc = crc32_(mem, memSize);
+    if (!force && crc == g_saveRamLastCrc) return;
+    if (!force && g_saveRamLastFlush.time_since_epoch().count() != 0 && (now - g_saveRamLastFlush) < std::chrono::milliseconds(1000)) return;
+
+    if (writeFile_(g_saveRamPath.c_str(), mem, memSize)) {
+        g_saveRamLastCrc = crc;
+        g_saveRamLastFlush = now;
+    }
+}
+
 std::atomic<uint16_t> g_inputMask{0};
 std::atomic<bool> g_running{false};
+std::atomic<bool> g_paused{false};
 std::thread g_loopThread;
 
 struct UdpNetplay {
@@ -54,10 +251,129 @@ struct UdpNetplay {
     std::chrono::steady_clock::time_point lastRecv{};
 
     struct Packet {
+        uint32_t magic_be;
         uint32_t frame_be;
         uint16_t mask_be;
         uint16_t reserved_be;
     };
+
+    static constexpr uint32_t kMagicInput = 0x534E4F49u;     // 'SNOI'
+    static constexpr uint32_t kMagicStateInfo = 0x534E4F53u; // 'SNOS'
+    static constexpr uint32_t kMagicStateChunk = 0x534E4F43u;// 'SNOC'
+    static constexpr uint32_t kMagicStateAck = 0x534E4F41u;  // 'SNOA'
+
+    static constexpr uint32_t kMagicSaveRamInfo = 0x534E4F52u; // 'SNOR'
+    static constexpr uint32_t kMagicSaveRamChunk = 0x534E4F44u;// 'SNOD'
+    static constexpr uint32_t kMagicSaveRamAck = 0x534E4F45u;  // 'SNOE'
+
+    bool wantStateSync = false;
+    bool isHost = false;
+    bool peerStateReady = false; // host waits until peer acks
+    bool selfStateReady = true;  // joiner waits until loaded
+
+    bool joinAwaitingStateOffer = false;
+    std::chrono::steady_clock::time_point joinWaitStateOfferDeadline{};
+
+    bool joinAwaitingSaveRamOffer = false;
+    std::chrono::steady_clock::time_point joinWaitSaveRamOfferDeadline{};
+
+    std::vector<uint8_t> stateTx;
+    uint32_t stateSize = 0;
+    uint32_t stateCrc = 0;
+    uint16_t stateChunkSize = 1024;
+    uint16_t stateChunkCount = 0;
+    std::chrono::steady_clock::time_point lastInfoSent{};
+    uint16_t nextChunkToSend = 0;
+
+    std::vector<uint8_t> stateRx;
+    std::vector<uint8_t> stateRxHave;
+    uint16_t stateRxHaveCount = 0;
+
+    // SaveRAM (SRAM) sync. Used both for initial join sync and background updates.
+    bool wantSaveRamSync = false;
+    bool saveRamGate = false; // if true, blocks readyToRun until ack/loaded
+    bool peerSaveRamReady = true;
+    bool selfSaveRamReady = true;
+
+    std::vector<uint8_t> saveRamTx;
+    uint32_t saveRamSize = 0;
+    uint32_t saveRamCrc = 0;
+    uint16_t saveRamChunkSize = 1024;
+    uint16_t saveRamChunkCount = 0;
+    std::chrono::steady_clock::time_point lastSaveRamInfoSent{};
+    uint16_t nextSaveRamChunkToSend = 0;
+
+    std::vector<uint8_t> saveRamRx;
+    std::vector<uint8_t> saveRamRxHave;
+    uint16_t saveRamRxHaveCount = 0;
+
+    void configureStateSyncHost(std::vector<uint8_t>&& bytes) noexcept {
+        stateTx = std::move(bytes);
+        stateSize = static_cast<uint32_t>(stateTx.size());
+        stateCrc = stateSize ? crc32_(stateTx.data(), stateTx.size()) : 0;
+        stateChunkSize = 1024;
+        stateChunkCount = static_cast<uint16_t>((stateSize + stateChunkSize - 1u) / stateChunkSize);
+        wantStateSync = (stateSize > 0);
+        isHost = true;
+        peerStateReady = !wantStateSync;
+        selfStateReady = true;
+        nextChunkToSend = 0;
+        lastInfoSent = {};
+    }
+
+    void configureStateSyncJoiner() noexcept {
+        isHost = false;
+        wantStateSync = false;
+        peerStateReady = true;
+        selfStateReady = true;
+        joinAwaitingStateOffer = true;
+        joinWaitStateOfferDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        stateRx.clear();
+        stateRxHave.clear();
+        stateRxHaveCount = 0;
+        stateSize = 0;
+        stateCrc = 0;
+        stateChunkSize = 1024;
+        stateChunkCount = 0;
+    }
+
+    bool queueSaveRamSync(std::vector<uint8_t>&& bytes, bool gateUntilAck) noexcept {
+        if (bytes.empty()) return false;
+        // Avoid restarting the same transfer.
+        const uint32_t crc = crc32_(bytes.data(), bytes.size());
+        if (wantSaveRamSync && crc == saveRamCrc && static_cast<uint32_t>(bytes.size()) == saveRamSize) {
+            return true;
+        }
+
+        saveRamTx = std::move(bytes);
+        saveRamSize = static_cast<uint32_t>(saveRamTx.size());
+        saveRamCrc = saveRamSize ? crc32_(saveRamTx.data(), saveRamTx.size()) : 0;
+        saveRamChunkSize = 1024;
+        saveRamChunkCount = static_cast<uint16_t>((saveRamSize + saveRamChunkSize - 1u) / saveRamChunkSize);
+
+        wantSaveRamSync = (saveRamSize > 0);
+        saveRamGate = gateUntilAck;
+        peerSaveRamReady = !saveRamGate;
+        nextSaveRamChunkToSend = 0;
+        lastSaveRamInfoSent = {};
+        return wantSaveRamSync;
+    }
+
+    void configureSaveRamSyncJoiner() noexcept {
+        joinAwaitingSaveRamOffer = false;
+        joinWaitSaveRamOfferDeadline = {};
+        wantSaveRamSync = false;
+        saveRamGate = false;
+        peerSaveRamReady = true;
+        selfSaveRamReady = true;
+        saveRamRx.clear();
+        saveRamRxHave.clear();
+        saveRamRxHaveCount = 0;
+        saveRamSize = 0;
+        saveRamCrc = 0;
+        saveRamChunkSize = 1024;
+        saveRamChunkCount = 0;
+    }
 
     static bool setNonBlocking(int fd) noexcept {
         const int flags = fcntl(fd, F_GETFL, 0);
@@ -279,6 +595,12 @@ struct UdpNetplay {
 
         // Room flow does not use server-assisted peer rendezvous here.
 
+        // Joiner waits briefly for a possible state offer.
+        if (localPlayerNum == 2) {
+            configureStateSyncJoiner();
+            configureSaveRamSyncJoiner();
+        }
+
         return true;
     }
 
@@ -293,16 +615,14 @@ struct UdpNetplay {
     void pumpRecv() noexcept {
         if (sock < 0) return;
         while (true) {
-            Packet p{};
+            uint8_t buf[1500] = {};
             sockaddr_in from{};
             socklen_t fromLen = sizeof(from);
-            const int n = static_cast<int>(recvfrom(sock, &p, sizeof(p), 0, reinterpret_cast<sockaddr*>(&from), &fromLen));
+            const int n = static_cast<int>(recvfrom(sock, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &fromLen));
             if (n < 0) {
                 break;
             }
-            if (n != static_cast<int>(sizeof(p))) {
-                continue;
-            }
+            if (n < 4) continue;
 
             // Learn/refresh peer endpoint from observed packets (NATs may rewrite source ports).
             if (discoverPeer) {
@@ -322,14 +642,299 @@ struct UdpNetplay {
                 }
             }
 
-            const uint32_t f = ntohl(p.frame_be);
-            const uint16_t m = ntohs(p.mask_be);
-            const uint32_t idx = f % kBufN;
-            remoteFrameTag[idx] = f;
-            remoteMask[idx] = m;
             hasPeer = true;
             lastRecv = std::chrono::steady_clock::now();
+
+            const uint32_t magic = read_u32_be_(buf);
+
+            if (magic == kMagicInput) {
+                if (n != static_cast<int>(sizeof(Packet))) continue;
+                const uint32_t f = read_u32_be_(buf + 4);
+                const uint16_t m = read_u16_be_(buf + 8);
+                const uint32_t idx = f % kBufN;
+                remoteFrameTag[idx] = f;
+                remoteMask[idx] = m;
+                continue;
+            }
+
+            if (magic == kMagicStateInfo) {
+                if (n < 16) continue;
+                if (isHost) continue;
+                const uint32_t sz = read_u32_be_(buf + 4);
+                const uint32_t crc = read_u32_be_(buf + 8);
+                const uint16_t csz = read_u16_be_(buf + 12);
+                const uint16_t ccnt = read_u16_be_(buf + 14);
+                if (sz == 0 || csz == 0 || ccnt == 0) continue;
+
+                if (!wantStateSync) {
+                    wantStateSync = true;
+                    selfStateReady = false;
+                    joinAwaitingStateOffer = false;
+                    stateSize = sz;
+                    stateCrc = crc;
+                    stateChunkSize = csz;
+                    stateChunkCount = ccnt;
+                    stateRxHaveCount = 0;
+                    try {
+                        stateRx.assign(stateSize, 0);
+                        stateRxHave.assign(stateChunkCount, 0);
+                    } catch (...) {
+                        wantStateSync = false;
+                        selfStateReady = true;
+                    }
+                }
+                continue;
+            }
+
+            if (magic == kMagicStateChunk) {
+                if (n < 12) continue;
+                if (isHost) continue;
+                if (!wantStateSync || selfStateReady) continue;
+                const uint16_t idx = read_u16_be_(buf + 4);
+                const uint16_t ccnt = read_u16_be_(buf + 6);
+                const uint16_t psz = read_u16_be_(buf + 8);
+                if (ccnt != stateChunkCount) continue;
+                if (idx >= stateChunkCount) continue;
+                if (psz == 0) continue;
+                if (12 + psz > static_cast<uint16_t>(n)) continue;
+
+                if (!stateRxHave.empty() && stateRxHave[idx] == 0) {
+                    stateRxHave[idx] = 1;
+                    stateRxHaveCount++;
+                }
+
+                const uint32_t off = static_cast<uint32_t>(idx) * static_cast<uint32_t>(stateChunkSize);
+                if (off >= stateSize) continue;
+                const uint32_t maxCopy = stateSize - off;
+                const uint32_t copyN = (psz < maxCopy) ? psz : maxCopy;
+                std::memcpy(stateRx.data() + off, buf + 12, copyN);
+
+                if (stateRxHaveCount == stateChunkCount) {
+                    const uint32_t got = crc32_(stateRx.data(), stateRx.size());
+                    if (got == stateCrc) {
+                        if (loadStateBytes_(stateRx.data(), stateRx.size())) {
+                            selfStateReady = true;
+                            uint8_t ack[12] = {};
+                            write_u32_be_(ack, kMagicStateAck);
+                            write_u32_be_(ack + 4, stateSize);
+                            write_u32_be_(ack + 8, stateCrc);
+                            sendto(sock, ack, sizeof(ack), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (magic == kMagicStateAck) {
+                if (n < 12) continue;
+                if (!isHost || !wantStateSync) continue;
+                const uint32_t sz = read_u32_be_(buf + 4);
+                const uint32_t crc = read_u32_be_(buf + 8);
+                if (sz == stateSize && crc == stateCrc) {
+                    peerStateReady = true;
+                }
+                continue;
+            }
+
+            if (magic == kMagicSaveRamInfo) {
+                if (n < 16) continue;
+                if (isHost) continue;
+                const uint32_t sz = read_u32_be_(buf + 4);
+                const uint32_t crc = read_u32_be_(buf + 8);
+                const uint16_t csz = read_u16_be_(buf + 12);
+                const uint16_t ccnt = read_u16_be_(buf + 14);
+                if (sz == 0 || csz == 0 || ccnt == 0) continue;
+
+                uint16_t flags = 0;
+                if (n >= 18) flags = read_u16_be_(buf + 16);
+                const bool gate = (flags & 1u) != 0;
+
+                // Start (or restart) a save-ram transfer.
+                wantSaveRamSync = true;
+                saveRamGate = gate;
+                selfSaveRamReady = !saveRamGate;
+                saveRamSize = sz;
+                saveRamCrc = crc;
+                saveRamChunkSize = csz;
+                saveRamChunkCount = ccnt;
+                saveRamRxHaveCount = 0;
+                try {
+                    saveRamRx.assign(saveRamSize, 0);
+                    saveRamRxHave.assign(saveRamChunkCount, 0);
+                } catch (...) {
+                    wantSaveRamSync = false;
+                    saveRamGate = false;
+                    selfSaveRamReady = true;
+                }
+                continue;
+            }
+
+            if (magic == kMagicSaveRamChunk) {
+                if (n < 12) continue;
+                if (isHost) continue;
+                if (!wantSaveRamSync) continue;
+                const uint16_t idx = read_u16_be_(buf + 4);
+                const uint16_t ccnt = read_u16_be_(buf + 6);
+                const uint16_t psz = read_u16_be_(buf + 8);
+                if (ccnt != saveRamChunkCount) continue;
+                if (idx >= saveRamChunkCount) continue;
+                if (psz == 0) continue;
+                if (12 + psz > static_cast<uint16_t>(n)) continue;
+
+                if (!saveRamRxHave.empty() && saveRamRxHave[idx] == 0) {
+                    saveRamRxHave[idx] = 1;
+                    saveRamRxHaveCount++;
+                }
+
+                const uint32_t off = static_cast<uint32_t>(idx) * static_cast<uint32_t>(saveRamChunkSize);
+                if (off >= saveRamSize) continue;
+                const uint32_t maxCopy = saveRamSize - off;
+                const uint32_t copyN = (psz < maxCopy) ? psz : maxCopy;
+                std::memcpy(saveRamRx.data() + off, buf + 12, copyN);
+
+                if (saveRamRxHaveCount == saveRamChunkCount) {
+                    const uint32_t got = crc32_(saveRamRx.data(), saveRamRx.size());
+                    if (got == saveRamCrc) {
+                        // Apply to core memory and persist.
+                        (void)applySaveRamBytes_(saveRamRx.data(), saveRamRx.size());
+                        if (!g_saveRamPath.empty()) {
+                            (void)writeFile_(g_saveRamPath.c_str(), saveRamRx.data(), saveRamRx.size());
+                            g_saveRamLastCrc = saveRamCrc;
+                        }
+
+                        uint8_t ack[12] = {};
+                        write_u32_be_(ack, kMagicSaveRamAck);
+                        write_u32_be_(ack + 4, saveRamSize);
+                        write_u32_be_(ack + 8, saveRamCrc);
+                        sendto(sock, ack, sizeof(ack), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+
+                        if (saveRamGate) {
+                            selfSaveRamReady = true;
+                            saveRamGate = false;
+                        }
+
+                        // Keep wantSaveRamSync=true so we can accept future updates; reset receive state.
+                        saveRamRxHaveCount = 0;
+                    }
+                }
+                continue;
+            }
+
+            if (magic == kMagicSaveRamAck) {
+                if (n < 12) continue;
+                if (!isHost || !wantSaveRamSync) continue;
+                const uint32_t sz = read_u32_be_(buf + 4);
+                const uint32_t crc = read_u32_be_(buf + 8);
+                if (sz == saveRamSize && crc == saveRamCrc) {
+                    if (saveRamGate) peerSaveRamReady = true;
+                    // Stop sending until we queue another update.
+                    wantSaveRamSync = false;
+                    saveRamGate = false;
+                }
+                continue;
+            }
         }
+    }
+
+    void pumpSaveRamSyncSend() noexcept {
+        if (sock < 0) return;
+        if (!isHost || !wantSaveRamSync) return;
+        if (!hasPeer) return;
+        if (discoverPeer && !hasPeer) return;
+        if (remote.sin_family != AF_INET || remote.sin_port == 0) return;
+
+        // If this transfer is gating startup, don't spam forever once acked.
+        if (saveRamGate && peerSaveRamReady) return;
+
+        const auto now = std::chrono::steady_clock::now();
+
+        if (lastSaveRamInfoSent.time_since_epoch().count() == 0 || now - lastSaveRamInfoSent >= std::chrono::milliseconds(250)) {
+            uint8_t info[18] = {};
+            write_u32_be_(info, kMagicSaveRamInfo);
+            write_u32_be_(info + 4, saveRamSize);
+            write_u32_be_(info + 8, saveRamCrc);
+            write_u16_be_(info + 12, saveRamChunkSize);
+            write_u16_be_(info + 14, saveRamChunkCount);
+            write_u16_be_(info + 16, saveRamGate ? 1u : 0u);
+            sendto(sock, info, sizeof(info), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+            lastSaveRamInfoSent = now;
+        }
+
+        const uint16_t burst = 6;
+        for (uint16_t k = 0; k < burst; ++k) {
+            const uint16_t idx = nextSaveRamChunkToSend;
+            nextSaveRamChunkToSend = static_cast<uint16_t>((nextSaveRamChunkToSend + 1) % saveRamChunkCount);
+            const uint32_t off = static_cast<uint32_t>(idx) * static_cast<uint32_t>(saveRamChunkSize);
+            if (off >= saveRamSize) continue;
+            const uint32_t remaining = saveRamSize - off;
+            const uint16_t psz = static_cast<uint16_t>((remaining > saveRamChunkSize) ? saveRamChunkSize : remaining);
+
+            uint8_t pkt[12 + 1024] = {};
+            write_u32_be_(pkt, kMagicSaveRamChunk);
+            write_u16_be_(pkt + 4, idx);
+            write_u16_be_(pkt + 6, saveRamChunkCount);
+            write_u16_be_(pkt + 8, psz);
+            write_u16_be_(pkt + 10, 0);
+            std::memcpy(pkt + 12, saveRamTx.data() + off, psz);
+            sendto(sock, pkt, static_cast<int>(12 + psz), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+        }
+    }
+
+    void pumpStateSyncSend() noexcept {
+        if (sock < 0) return;
+        if (!isHost || !wantStateSync) return;
+        if (!hasPeer || peerStateReady) return;
+        if (discoverPeer && !hasPeer) return;
+        if (remote.sin_family != AF_INET || remote.sin_port == 0) return;
+
+        const auto now = std::chrono::steady_clock::now();
+
+        // Periodically send state offer.
+        if (lastInfoSent.time_since_epoch().count() == 0 || now - lastInfoSent >= std::chrono::milliseconds(250)) {
+            uint8_t info[16] = {};
+            write_u32_be_(info, kMagicStateInfo);
+            write_u32_be_(info + 4, stateSize);
+            write_u32_be_(info + 8, stateCrc);
+            write_u16_be_(info + 12, stateChunkSize);
+            write_u16_be_(info + 14, stateChunkCount);
+            sendto(sock, info, sizeof(info), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+            lastInfoSent = now;
+        }
+
+        // Burst a few chunks per call.
+        const uint16_t burst = 6;
+        for (uint16_t k = 0; k < burst; ++k) {
+            const uint16_t idx = nextChunkToSend;
+            nextChunkToSend = static_cast<uint16_t>((nextChunkToSend + 1) % stateChunkCount);
+            const uint32_t off = static_cast<uint32_t>(idx) * static_cast<uint32_t>(stateChunkSize);
+            if (off >= stateSize) continue;
+            const uint32_t remaining = stateSize - off;
+            const uint16_t psz = static_cast<uint16_t>((remaining > stateChunkSize) ? stateChunkSize : remaining);
+
+            uint8_t pkt[12 + 1024] = {};
+            write_u32_be_(pkt, kMagicStateChunk);
+            write_u16_be_(pkt + 4, idx);
+            write_u16_be_(pkt + 6, stateChunkCount);
+            write_u16_be_(pkt + 8, psz);
+            write_u16_be_(pkt + 10, 0);
+            std::memcpy(pkt + 12, stateTx.data() + off, psz);
+            sendto(sock, pkt, static_cast<int>(12 + psz), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+        }
+    }
+
+    bool readyToRun() noexcept {
+        if (!hasPeer) return false;
+        if (!isHost && joinAwaitingStateOffer) {
+            if (std::chrono::steady_clock::now() < joinWaitStateOfferDeadline) {
+                return false;
+            }
+            joinAwaitingStateOffer = false;
+        }
+        if (isHost && wantStateSync) return peerStateReady;
+        if (!isHost && wantStateSync) return selfStateReady;
+        if (isHost && saveRamGate) return peerSaveRamReady;
+        if (!isHost && saveRamGate) return selfSaveRamReady;
+        return true;
     }
 
     void sendLocal(uint16_t mask) noexcept {
@@ -349,6 +954,7 @@ struct UdpNetplay {
             const uint32_t i = f % kBufN;
             if (sentFrameTag[i] != f) continue;
             Packet p{};
+            p.magic_be = htonl(kMagicInput);
             p.frame_be = htonl(f);
             p.mask_be = htons(sentMask[i]);
             p.reserved_be = 0;
@@ -371,6 +977,7 @@ std::unique_ptr<UdpNetplay> g_netplay;
 std::atomic<bool> g_netplayEnabled{false};
 
 // 0=off, 1=connecting (no peer), 2=waiting (missing inputs), 3=ok
+// 4=syncing state
 std::atomic<int> g_netplayStatus{0};
 
 // --- Video buffer (RGBA8888) ---
@@ -646,6 +1253,7 @@ void loop60fps() {
     auto next = clock::now();
     while (g_running.load(std::memory_order_relaxed)) {
         const uint16_t localMask = g_inputMask.load(std::memory_order_relaxed);
+        const bool paused = g_paused.load(std::memory_order_relaxed);
 
         // Fixed-timestep loop with bounded catch-up.
         // If this is too small and we ever miss our schedule (GC, I/O, CPU contention),
@@ -656,12 +1264,53 @@ void loop60fps() {
         while (now >= next && steps < kMaxCatchUpFrames) {
             next += frame;
 
+            // Persist in-game saves (SRAM) periodically (independent of savestates).
+            maybeFlushSaveRam_(false);
+
             if (g_netplayEnabled.load(std::memory_order_relaxed) && g_netplay) {
                 g_netplay->pumpRecv();
-                g_netplay->sendLocal(localMask);
+                // If paused, stop sending inputs so the peer quickly stalls.
+                if (!paused) {
+                    g_netplay->sendLocal(localMask);
+                }
+
+                g_netplay->pumpStateSyncSend();
+                g_netplay->pumpSaveRamSyncSend();
+
+                // Host: if SRAM changes, enqueue an update for the joiner.
+                if (g_netplay->localPlayerNum == 1 && !g_saveRamPath.empty()) {
+                    auto& core = snesonline::EmulatorEngine::instance().core();
+                    void* mem = core.memoryData(kRetroMemorySaveRam_);
+                    const std::size_t memSize = core.memorySize(kRetroMemorySaveRam_);
+                    if (mem && memSize > 0) {
+                        const uint32_t crc = crc32_(mem, memSize);
+                        static uint32_t lastSentCrc = 0;
+                        static auto lastSentAt = clock::time_point{};
+                        const auto now2 = clock::now();
+                        if (crc != lastSentCrc && (lastSentAt.time_since_epoch().count() == 0 || (now2 - lastSentAt) > std::chrono::seconds(2))) {
+                            std::vector<uint8_t> bytes;
+                            if (getSaveRamBytes_(bytes)) {
+                                (void)g_netplay->queueSaveRamSync(std::move(bytes), false);
+                                lastSentCrc = crc;
+                                lastSentAt = now2;
+                            }
+                        }
+                    }
+                }
 
                 if (!g_netplay->hasPeer) {
                     g_netplayStatus.store(1, std::memory_order_relaxed);
+                    break;
+                }
+
+                if (!g_netplay->readyToRun()) {
+                    g_netplayStatus.store(4, std::memory_order_relaxed);
+                    break;
+                }
+
+                if (paused) {
+                    // Keep loop alive for networking/state sync, but don't advance frames.
+                    g_netplayStatus.store(3, std::memory_order_relaxed);
                     break;
                 }
 
@@ -682,12 +1331,20 @@ void loop60fps() {
                 g_netplay->frame++;
             } else {
                 g_netplayStatus.store(0, std::memory_order_relaxed);
+                if (paused) {
+                    break;
+                }
                 snesonline::EmulatorEngine::instance().setLocalInputMask(localMask);
                 snesonline::EmulatorEngine::instance().advanceFrame();
             }
 
             steps++;
             now = clock::now();
+
+            if (paused) {
+                // Don't try to catch up accumulated time while paused.
+                break;
+            }
         }
 
         // Do NOT resync `next` forward here.
@@ -709,7 +1366,7 @@ void loop60fps() {
 } // namespace
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_snesonline_NativeBridge_nativeInitialize(JNIEnv* env, jclass /*cls*/, jstring corePath, jstring romPath,
+Java_com_snesonline_NativeBridge_nativeInitialize(JNIEnv* env, jclass /*cls*/, jstring corePath, jstring romPath, jstring statePath, jstring savePath,
                                                  jboolean enableNetplay, jstring remoteHost,
                                                  jint remotePort, jint localPort, jint localPlayerNum,
                                                  jstring roomServerUrl, jstring roomCode) {
@@ -717,6 +1374,16 @@ Java_com_snesonline_NativeBridge_nativeInitialize(JNIEnv* env, jclass /*cls*/, j
 
     const char* core = env->GetStringUTFChars(corePath, nullptr);
     const char* rom = env->GetStringUTFChars(romPath, nullptr);
+
+    const char* state = nullptr;
+    if (statePath) {
+        state = env->GetStringUTFChars(statePath, nullptr);
+    }
+
+    const char* save = nullptr;
+    if (savePath) {
+        save = env->GetStringUTFChars(savePath, nullptr);
+    }
 
     const char* remote = nullptr;
     if (remoteHost) {
@@ -740,18 +1407,76 @@ Java_com_snesonline_NativeBridge_nativeInitialize(JNIEnv* env, jclass /*cls*/, j
         eng.core().setAudioSink(nullptr, &audioSink);
         configureAudioLatencyCaps(eng.core().sampleRateHz());
 
+        const bool wantNetplay = (enableNetplay == JNI_TRUE);
+        const uint8_t pnum = static_cast<uint8_t>((localPlayerNum == 2) ? 2 : 1);
+
+        // Natural saves (SRAM):
+        // - Offline: auto-load last per-ROM save (default path).
+        // - Netplay: host does NOT auto-load; must be explicitly selected via savePath.
+        // - Netplay joiner never loads local SRAM (may receive host sync).
+        const std::string defaultSavePath = makeSaveRamPathFromRom_(rom);
+        g_saveRamPath = (save && save[0]) ? std::string(save) : defaultSavePath;
+        g_saveRamLoadedFromFile = false;
+        g_saveRamLoadedExplicitly = false;
+
+        if (!wantNetplay) {
+            (void)loadSaveRamFromFile_(g_saveRamPath);
+        } else if (pnum == 1) {
+            if (save && save[0]) {
+                (void)loadSaveRamFromFile_(g_saveRamPath);
+                g_saveRamLoadedExplicitly = g_saveRamLoadedFromFile;
+            }
+        }
+
+        // Track current CRC so we only write on changes.
+        {
+            void* mem = eng.core().memoryData(kRetroMemorySaveRam_);
+            const std::size_t memSize = eng.core().memorySize(kRetroMemorySaveRam_);
+            g_saveRamLastCrc = (mem && memSize) ? crc32_(mem, memSize) : 0;
+            g_saveRamLastCheck = {};
+            g_saveRamLastFlush = {};
+        }
+
         g_netplayEnabled.store(false, std::memory_order_relaxed);
         g_netplay.reset();
 
-        const bool wantNetplay = (enableNetplay == JNI_TRUE);
+        // Best-effort: load a state before starting.
+        // Netplay rule: only Player 1 (host) state is considered.
+        if (state && state[0]) {
+            const bool wantNetplay = (enableNetplay == JNI_TRUE);
+            const uint8_t pnum = static_cast<uint8_t>((localPlayerNum == 2) ? 2 : 1);
+            const bool canUse = (!wantNetplay) || (pnum == 1);
+            if (canUse) {
+                std::vector<uint8_t> bytes;
+                if (readFile_(state, bytes)) {
+                    (void)loadStateBytes_(bytes.data(), bytes.size());
+                }
+            }
+        }
+
         if (wantNetplay) {
             const uint16_t rp = static_cast<uint16_t>((remotePort >= 1 && remotePort <= 65535) ? remotePort : 7000);
             const uint16_t lp = static_cast<uint16_t>((localPort >= 1 && localPort <= 65535) ? localPort : 7000);
-            const uint8_t pnum = static_cast<uint8_t>((localPlayerNum == 2) ? 2 : 1);
 
             auto np = std::make_unique<UdpNetplay>();
             const char* host = (remote && remote[0]) ? remote : "";
             if (np->start(host, rp, lp, pnum, roomUrl ? roomUrl : "", room ? room : "")) {
+                // Host: stage the same state for the peer to load.
+                if (pnum == 1 && state && state[0]) {
+                    std::vector<uint8_t> bytes;
+                    if (readFile_(state, bytes)) {
+                        np->configureStateSyncHost(std::move(bytes));
+                    }
+                }
+
+                // Host: if SRAM was explicitly loaded, require peer to receive it before starting.
+                if (pnum == 1 && g_saveRamLoadedExplicitly) {
+                    std::vector<uint8_t> bytes;
+                    if (getSaveRamBytes_(bytes)) {
+                        (void)np->queueSaveRamSync(std::move(bytes), true);
+                    }
+                }
+
                 g_netplay = std::move(np);
                 g_netplayEnabled.store(true, std::memory_order_relaxed);
             } else {
@@ -763,6 +1488,14 @@ Java_com_snesonline_NativeBridge_nativeInitialize(JNIEnv* env, jclass /*cls*/, j
 
     env->ReleaseStringUTFChars(corePath, core);
     env->ReleaseStringUTFChars(romPath, rom);
+
+    if (statePath && state) {
+        env->ReleaseStringUTFChars(statePath, state);
+    }
+
+    if (savePath && save) {
+        env->ReleaseStringUTFChars(savePath, save);
+    }
 
     if (remoteHost && remote) {
         env->ReleaseStringUTFChars(remoteHost, remote);
@@ -778,8 +1511,68 @@ Java_com_snesonline_NativeBridge_nativeInitialize(JNIEnv* env, jclass /*cls*/, j
     return (ok && netplayOk) ? JNI_TRUE : JNI_FALSE;
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_snesonline_NativeBridge_nativeSaveStateToFile(JNIEnv* env, jclass /*cls*/, jstring statePath) {
+    if (!statePath) return JNI_FALSE;
+    const char* path = env->GetStringUTFChars(statePath, nullptr);
+    if (!path || !path[0]) {
+        if (path) env->ReleaseStringUTFChars(statePath, path);
+        return JNI_FALSE;
+    }
+
+    snesonline::SaveState st;
+    const bool ok = snesonline::EmulatorEngine::instance().saveState(st);
+    bool wrote = false;
+    if (ok && st.sizeBytes > 0 && st.buffer.data()) {
+        wrote = writeFile_(path, st.buffer.data(), st.sizeBytes);
+    }
+
+    env->ReleaseStringUTFChars(statePath, path);
+    return wrote ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_snesonline_NativeBridge_nativeLoadStateFromFile(JNIEnv* env, jclass /*cls*/, jstring statePath) {
+    if (!statePath) return JNI_FALSE;
+    const char* path = env->GetStringUTFChars(statePath, nullptr);
+    if (!path || !path[0]) {
+        if (path) env->ReleaseStringUTFChars(statePath, path);
+        return JNI_FALSE;
+    }
+
+    // Netplay rule: only host can load the canonical state.
+    if (g_netplayEnabled.load(std::memory_order_relaxed) && g_netplay && g_netplay->localPlayerNum != 1) {
+        env->ReleaseStringUTFChars(statePath, path);
+        return JNI_FALSE;
+    }
+
+    std::vector<uint8_t> bytes;
+    const bool okRead = readFile_(path, bytes);
+    bool okLoad = false;
+    if (okRead && !bytes.empty()) {
+        okLoad = loadStateBytes_(bytes.data(), bytes.size());
+        if (okLoad) {
+            // If host in netplay, immediately stage and transfer the same state to the joiner.
+            if (g_netplayEnabled.load(std::memory_order_relaxed) && g_netplay && g_netplay->localPlayerNum == 1) {
+                g_netplay->configureStateSyncHost(std::move(bytes));
+            }
+        }
+    }
+
+    env->ReleaseStringUTFChars(statePath, path);
+    return okLoad ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_snesonline_NativeBridge_nativeSetPaused(JNIEnv* /*env*/, jclass /*cls*/, jboolean paused) {
+    g_paused.store(paused == JNI_TRUE, std::memory_order_relaxed);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_snesonline_NativeBridge_nativeShutdown(JNIEnv* /*env*/, jclass /*cls*/) {
+    // Flush natural saves (SRAM) on exit.
+    maybeFlushSaveRam_(true);
+
     g_running.store(false, std::memory_order_relaxed);
     if (g_loopThread.joinable()) g_loopThread.join();
 

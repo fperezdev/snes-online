@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Simple, fully self-contained app icon (no mipmaps needed). -->
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#151515" />
+            <corners android:radius="24dp" />
+        </shape>
+    </item>
+
+    <!-- Controller body -->
+    <item android:left="10dp" android:top="26dp" android:right="10dp" android:bottom="26dp">
+        <shape android:shape="rectangle">
+            <solid android:color="#2A2A2A" />
+            <corners android:radius="28dp" />
+            <stroke android:width="2dp" android:color="#E0E0E0" />
+        </shape>
+    </item>
+
+    <!-- D-pad cross (two rectangles) -->
+    <item android:left="24dp" android:top="44dp" android:right="66dp" android:bottom="44dp">
+        <shape android:shape="rectangle">
+            <solid android:color="#DADADA" />
+            <corners android:radius="6dp" />
+        </shape>
+    </item>
+    <item android:left="36dp" android:top="34dp" android:right="78dp" android:bottom="34dp">
+        <shape android:shape="rectangle">
+            <solid android:color="#DADADA" />
+            <corners android:radius="6dp" />
+        </shape>
+    </item>
+
+    <!-- ABXY buttons (4 circles) -->
+    <item android:left="70dp" android:top="44dp" android:right="26dp" android:bottom="44dp">
+        <shape android:shape="oval">
+            <solid android:color="#FF6B6B" />
+        </shape>
+    </item>
+    <item android:left="58dp" android:top="34dp" android:right="38dp" android:bottom="54dp">
+        <shape android:shape="oval">
+            <solid android:color="#FFD166" />
+        </shape>
+    </item>
+    <item android:left="82dp" android:top="34dp" android:right="14dp" android:bottom="54dp">
+        <shape android:shape="oval">
+            <solid android:color="#4D96FF" />
+        </shape>
+    </item>
+    <item android:left="70dp" android:top="24dp" android:right="26dp" android:bottom="64dp">
+        <shape android:shape="oval">
+            <solid android:color="#6BCB77" />
+        </shape>
+    </item>
+</layer-list>

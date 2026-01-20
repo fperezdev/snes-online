@@ -81,6 +81,10 @@ bool LibretroCore::load(const char* corePath) noexcept {
     retro_set_audio_sample_ = reinterpret_cast<void (*)(void (*)(int16_t, int16_t))>(resolve_("retro_set_audio_sample"));
     retro_set_audio_sample_batch_ = reinterpret_cast<void (*)(size_t (*)(const int16_t*, size_t))>(resolve_("retro_set_audio_sample_batch"));
 
+    // Optional (SRAM / SaveRAM, etc.).
+    retro_get_memory_data_ = reinterpret_cast<void* (*)(unsigned)>(resolve_("retro_get_memory_data"));
+    retro_get_memory_size_ = reinterpret_cast<size_t (*)(unsigned)>(resolve_("retro_get_memory_size"));
+
     if (!retro_init_ || !retro_deinit_ || !retro_run_ || !retro_serialize_size_ || !retro_serialize_ || !retro_unserialize_ || !retro_load_game_) {
         unload();
         return false;
@@ -135,6 +139,9 @@ void LibretroCore::unload() noexcept {
     retro_set_audio_sample_ = nullptr;
     retro_set_audio_sample_batch_ = nullptr;
 
+    retro_get_memory_data_ = nullptr;
+    retro_get_memory_size_ = nullptr;
+
     inputMasks_[0].store(0, std::memory_order_relaxed);
     inputMasks_[1].store(0, std::memory_order_relaxed);
 
@@ -148,6 +155,16 @@ void LibretroCore::unload() noexcept {
     pixelFormat_ = PixelFormat::XRGB8888;
     fps_ = 60.0;
     sampleRateHz_ = 48000.0;
+}
+
+void* LibretroCore::memoryData(unsigned id) noexcept {
+    if (!retro_get_memory_data_) return nullptr;
+    return retro_get_memory_data_(id);
+}
+
+std::size_t LibretroCore::memorySize(unsigned id) const noexcept {
+    if (!retro_get_memory_size_) return 0;
+    return static_cast<std::size_t>(retro_get_memory_size_(id));
 }
 
 bool LibretroCore::loadGame(const char* romPath) noexcept {
