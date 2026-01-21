@@ -10,6 +10,9 @@ struct AppConfig {
     bool netplayEnabled = false;
     // If true, use UDP lockstep netplay (Android-compatible) instead of GGPO.
     bool netplayLockstep = false;
+    // GGPO only: delay local inputs by N frames (0..GGPO_MAX_PREDICTION_FRAMES).
+    // Higher values reduce visible rollbacks/desync-looking artifacts at the cost of added input latency.
+    uint8_t netplayFrameDelay = 0;
     // Must be 1 or 2.
     uint8_t localPlayerNum = 1;
     // Empty -> host (Player 1) listens and auto-discovers the peer from the first UDP packet.

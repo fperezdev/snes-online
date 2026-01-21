@@ -152,6 +152,7 @@ static std::string makeSaveRamPathFromRom_(const char* romPath) {
 }
 
 static constexpr unsigned kRetroMemorySaveRam_ = 0; // RETRO_MEMORY_SAVE_RAM
+static constexpr unsigned kRetroMemorySystemRam_ = 2; // RETRO_MEMORY_SYSTEM_RAM
 
 static std::string g_saveRamPath;
 static bool g_saveRamLoadedFromFile = false;
@@ -241,11 +242,24 @@ struct UdpNetplay {
     static constexpr uint32_t kInputDelayFrames = 5;
     // Re-send a small window of recent frames to survive UDP loss.
     static constexpr uint32_t kResendWindow = 16;
+
+    // Periodically exchange a light-weight checksum so we can detect true emulator desyncs.
+    // (Does not affect determinism; it only detects mismatch and triggers a resync.)
+    static constexpr uint32_t kHashIntervalFrames = 60; // ~1s @60fps
     std::array<uint16_t, kBufN> remoteMask{};
     std::array<uint32_t, kBufN> remoteFrameTag{};
 
     std::array<uint16_t, kBufN> sentMask{};
     std::array<uint32_t, kBufN> sentFrameTag{};
+
+    std::array<uint32_t, kBufN> localHash{};
+    std::array<uint32_t, kBufN> localHashTag{};
+    std::array<uint32_t, kBufN> remoteHash{};
+    std::array<uint32_t, kBufN> remoteHashTag{};
+
+    bool pendingResyncHost = false;
+    std::chrono::steady_clock::time_point lastResyncRequestSent{};
+    std::chrono::steady_clock::time_point lastResyncTriggered{};
 
     bool hasPeer = false;
     std::chrono::steady_clock::time_point lastRecv{};
@@ -258,6 +272,8 @@ struct UdpNetplay {
     };
 
     static constexpr uint32_t kMagicInput = 0x534E4F49u;     // 'SNOI'
+    static constexpr uint32_t kMagicHash = 0x534E4F48u;      // 'SNOH'
+    static constexpr uint32_t kMagicResyncReq = 0x534E4F51u; // 'SNOQ'
     static constexpr uint32_t kMagicStateInfo = 0x534E4F53u; // 'SNOS'
     static constexpr uint32_t kMagicStateChunk = 0x534E4F43u;// 'SNOC'
     static constexpr uint32_t kMagicStateAck = 0x534E4F41u;  // 'SNOA'
@@ -534,6 +550,10 @@ struct UdpNetplay {
         remoteMask.fill(0);
         sentFrameTag.fill(0xFFFFFFFFu);
         sentMask.fill(0);
+        localHashTag.fill(0xFFFFFFFFu);
+        localHash.fill(0);
+        remoteHashTag.fill(0xFFFFFFFFu);
+        remoteHash.fill(0);
         frame = 0;
 
         // Prime our local input history for the first few frames so the sim can start immediately.
@@ -545,6 +565,10 @@ struct UdpNetplay {
 
         hasPeer = false;
         lastRecv = {};
+
+        pendingResyncHost = false;
+        lastResyncRequestSent = {};
+        lastResyncTriggered = {};
 
         discoverPeer = false;
 
@@ -654,6 +678,41 @@ struct UdpNetplay {
                 const uint32_t idx = f % kBufN;
                 remoteFrameTag[idx] = f;
                 remoteMask[idx] = m;
+                continue;
+            }
+
+            if (magic == kMagicHash) {
+                if (n < 12) continue;
+                const uint32_t f = read_u32_be_(buf + 4);
+                const uint32_t h = read_u32_be_(buf + 8);
+                const uint32_t idx = f % kBufN;
+                remoteHashTag[idx] = f;
+                remoteHash[idx] = h;
+
+                // If we have a local hash for the same completed frame, compare.
+                if (localHashTag[idx] == f && localHash[idx] != 0 && h != 0 && localHash[idx] != h) {
+                    if (localPlayerNum == 1) {
+                        pendingResyncHost = true;
+                    } else {
+                        // Ask host to resync. Cooldown prevents spamming.
+                        const auto now = std::chrono::steady_clock::now();
+                        if (lastResyncRequestSent.time_since_epoch().count() == 0 || (now - lastResyncRequestSent) > std::chrono::seconds(2)) {
+                            uint8_t req[8] = {};
+                            write_u32_be_(req, kMagicResyncReq);
+                            write_u32_be_(req + 4, f);
+                            sendto(sock, req, sizeof(req), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+                            lastResyncRequestSent = now;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (magic == kMagicResyncReq) {
+                if (n < 8) continue;
+                if (localPlayerNum != 1) continue;
+                // Joiner requested a state resync (likely due to desync detection).
+                pendingResyncHost = true;
                 continue;
             }
 
@@ -834,6 +893,81 @@ struct UdpNetplay {
                 continue;
             }
         }
+    }
+
+    bool computeFastStateHash_(uint32_t& outHash) noexcept {
+        outHash = 0;
+        // Prefer a cheap deterministic region (system RAM) to avoid frequent full savestates.
+        auto& core = snesonline::EmulatorEngine::instance().core();
+        void* mem = core.memoryData(kRetroMemorySystemRam_);
+        const std::size_t memSize = core.memorySize(kRetroMemorySystemRam_);
+        if (!mem || memSize == 0) return false;
+        outHash = crc32_(mem, memSize);
+        return true;
+    }
+
+    void recordLocalHashForCompletedFrame_(uint32_t completedFrame) noexcept {
+        uint32_t h = 0;
+        if (!computeFastStateHash_(h)) return;
+        if (h == 0) return;
+        const uint32_t idx = completedFrame % kBufN;
+        localHashTag[idx] = completedFrame;
+        localHash[idx] = h;
+    }
+
+    void maybeSendLocalHashForCompletedFrame_(uint32_t completedFrame) noexcept {
+        if (sock < 0) return;
+        if (!hasPeer) return;
+        if (discoverPeer && !hasPeer) return;
+        if (remote.sin_family != AF_INET || remote.sin_port == 0) return;
+        if (kHashIntervalFrames == 0) return;
+        if ((completedFrame % kHashIntervalFrames) != 0) return;
+
+        const uint32_t idx = completedFrame % kBufN;
+        if (localHashTag[idx] != completedFrame) return;
+        const uint32_t h = localHash[idx];
+        if (h == 0) return;
+
+        uint8_t pkt[12] = {};
+        write_u32_be_(pkt, kMagicHash);
+        write_u32_be_(pkt + 4, completedFrame);
+        write_u32_be_(pkt + 8, h);
+        sendto(sock, pkt, sizeof(pkt), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+    }
+
+    void performResyncHostIfPending_() noexcept {
+        if (localPlayerNum != 1) return;
+        if (!pendingResyncHost) return;
+        pendingResyncHost = false;
+
+        // Avoid re-triggering too frequently.
+        const auto now = std::chrono::steady_clock::now();
+        if (lastResyncTriggered.time_since_epoch().count() != 0 && (now - lastResyncTriggered) < std::chrono::seconds(2)) {
+            return;
+        }
+
+        // Don't stomp an in-flight transfer.
+        if (wantStateSync && !peerStateReady) {
+            return;
+        }
+
+        snesonline::SaveState st;
+        if (!snesonline::EmulatorEngine::instance().saveState(st)) {
+            return;
+        }
+        if (st.sizeBytes == 0 || !st.buffer.data()) {
+            return;
+        }
+
+        std::vector<uint8_t> bytes;
+        try {
+            bytes.resize(st.sizeBytes);
+        } catch (...) {
+            return;
+        }
+        std::memcpy(bytes.data(), st.buffer.data(), st.sizeBytes);
+        configureStateSyncHost(std::move(bytes));
+        lastResyncTriggered = now;
     }
 
     void pumpSaveRamSyncSend() noexcept {
@@ -1277,6 +1411,9 @@ void loop60fps() {
                 g_netplay->pumpStateSyncSend();
                 g_netplay->pumpSaveRamSyncSend();
 
+                // If host detected a desync (or received a resync request), start a state sync.
+                g_netplay->performResyncHostIfPending_();
+
                 // Host: if SRAM changes, enqueue an update for the joiner.
                 if (g_netplay->localPlayerNum == 1 && !g_saveRamPath.empty()) {
                     auto& core = snesonline::EmulatorEngine::instance().core();
@@ -1329,6 +1466,11 @@ void loop60fps() {
                 snesonline::EmulatorEngine::instance().setInputMask(1, localIsP1 ? remoteForFrame : localForFrame);
                 snesonline::EmulatorEngine::instance().advanceFrame();
                 g_netplay->frame++;
+
+                // Record + periodically exchange a light-weight checksum for desync detection.
+                const uint32_t completedFrame = g_netplay->frame - 1;
+                g_netplay->recordLocalHashForCompletedFrame_(completedFrame);
+                g_netplay->maybeSendLocalHashForCompletedFrame_(completedFrame);
             } else {
                 g_netplayStatus.store(0, std::memory_order_relaxed);
                 if (paused) {

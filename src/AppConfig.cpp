@@ -108,6 +108,16 @@ static uint32_t parseU32(const std::string& v, uint32_t fallback) {
     return static_cast<uint32_t>(n);
 }
 
+static uint8_t parseU8Clamped(const std::string& v, uint8_t fallback, uint8_t maxVal) {
+    const std::string t = trim(v);
+    if (t.empty()) return fallback;
+    char* end = nullptr;
+    unsigned long n = std::strtoul(t.c_str(), &end, 10);
+    if (!end || end == t.c_str()) return fallback;
+    if (n > static_cast<unsigned long>(maxVal)) n = static_cast<unsigned long>(maxVal);
+    return static_cast<uint8_t>(n);
+}
+
 bool loadConfig(const std::string& path, AppConfig& outCfg) {
     std::ifstream f(path);
     if (!f.is_open()) return false;
@@ -126,6 +136,7 @@ bool loadConfig(const std::string& path, AppConfig& outCfg) {
 
         if (iequals(key, "netplayEnabled")) outCfg.netplayEnabled = parseBool(val, outCfg.netplayEnabled);
         else if (iequals(key, "netplayLockstep")) outCfg.netplayLockstep = parseBool(val, outCfg.netplayLockstep);
+        else if (iequals(key, "netplayFrameDelay")) outCfg.netplayFrameDelay = parseU8Clamped(val, outCfg.netplayFrameDelay, 8);
         else if (iequals(key, "localPlayerNum")) outCfg.localPlayerNum = parsePlayerNum(val, outCfg.localPlayerNum);
         else if (iequals(key, "remoteIp")) outCfg.remoteIp = val;
         else if (iequals(key, "remotePort")) outCfg.remotePort = parseU16(val, outCfg.remotePort);
@@ -150,6 +161,7 @@ bool saveConfig(const std::string& path, const AppConfig& cfg) {
     f << "[netplay]\n";
     f << "netplayEnabled=" << (cfg.netplayEnabled ? "true" : "false") << "\n";
     f << "netplayLockstep=" << (cfg.netplayLockstep ? "true" : "false") << "\n";
+    f << "netplayFrameDelay=" << static_cast<unsigned>(cfg.netplayFrameDelay) << "\n";
     f << "localPlayerNum=" << static_cast<int>(cfg.localPlayerNum == 2 ? 2 : 1) << "\n";
     f << "remoteIp=" << cfg.remoteIp << "\n";
     f << "remotePort=" << cfg.remotePort << "\n";

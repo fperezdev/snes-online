@@ -24,6 +24,9 @@ public:
         const char* remoteIp = "127.0.0.1";
         uint16_t remotePort = 7000;
         uint16_t localPort = 7000;
+        // GGPO only: delay local inputs by N frames (0..GGPO_MAX_PREDICTION_FRAMES).
+        // Helps reduce visible rollbacks under jitter/packet loss at the cost of added input latency.
+        uint8_t frameDelay = 0;
         // Must be 1 or 2. The other side should use the opposite.
         uint8_t localPlayerNum = 1;
     };
@@ -51,6 +54,7 @@ private:
         std::string remoteIp;
         uint16_t remotePort = 7000;
         uint16_t localPort = 7000;
+        uint8_t frameDelay = 0;
         uint8_t localPlayerNum = 1;
     } lastCfg_;
 

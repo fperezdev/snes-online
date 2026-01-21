@@ -134,6 +134,7 @@ bool NetplaySession::startGgpoSession_() noexcept {
 
     const char* gameName = lastCfg_.gameName.c_str();
     const int localPort = static_cast<int>(lastCfg_.localPort ? lastCfg_.localPort : 7000);
+    const int frameDelay = static_cast<int>(lastCfg_.frameDelay);
 
     GGPOErrorCode err = ggpo_start_session(&session_, &cb, gameName, 2, static_cast<int>(sizeof(uint16_t)), localPort);
     if (err != GGPO_OK) {
@@ -154,6 +155,11 @@ bool NetplaySession::startGgpoSession_() noexcept {
         return false;
     }
     localPlayerHandle_ = static_cast<int>(p1Handle);
+
+    if (frameDelay > 0) {
+        // Best-effort: this simply adds local input latency to reduce visible rollbacks.
+        (void)ggpo_set_frame_delay(session_, p1Handle, frameDelay);
+    }
 
     GGPOPlayer p2{};
     p2.size = sizeof(p2);
@@ -257,6 +263,7 @@ bool NetplaySession::start(const Config& cfg) noexcept {
     lastCfg_.remoteIp = (cfg.remoteIp != nullptr) ? cfg.remoteIp : std::string();
     lastCfg_.remotePort = cfg.remotePort;
     lastCfg_.localPort = cfg.localPort;
+    lastCfg_.frameDelay = cfg.frameDelay;
     lastCfg_.localPlayerNum = (cfg.localPlayerNum == 2) ? 2 : 1;
 
     reconnectBackoffMs_ = 1000;
@@ -403,6 +410,7 @@ void NetplaySession::tick() noexcept {
             c.remoteIp = lastCfg_.remoteIp.c_str();
             c.remotePort = lastCfg_.remotePort;
             c.localPort = lastCfg_.localPort;
+            c.frameDelay = lastCfg_.frameDelay;
             c.localPlayerNum = lastCfg_.localPlayerNum;
 
             const bool ok = start(c);

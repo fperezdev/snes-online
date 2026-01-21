@@ -1269,6 +1269,7 @@ int main(int argc, char** argv) {
             np.remoteIp = autoDiscover ? "" : effectiveIp;
             np.remotePort = autoDiscover ? 0 : effectiveRemotePort;
             np.localPort = effectiveLocalPort;
+            np.frameDelay = cfg.netplayFrameDelay;
             np.localPlayerNum = effectivePlayer;
 
             if (!netplay.start(np)) {
