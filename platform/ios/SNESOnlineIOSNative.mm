@@ -1051,7 +1051,7 @@ struct UdpNetplay {
     void sendKeepAlive() noexcept {
         if (sock < 0) return;
         if (!hasPeer) return;
-        if (remote.sin_family != AF_INET || remote.sin_port == 0) return;
+        if (remote.sin6_family != AF_INET6 || remote.sin6_port == 0) return;
 
         const auto now = std::chrono::steady_clock::now();
         if (lastKeepAliveSent.time_since_epoch().count() != 0 && (now - lastKeepAliveSent) < std::chrono::milliseconds(250)) {
