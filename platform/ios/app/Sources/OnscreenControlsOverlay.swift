@@ -6,22 +6,22 @@ import UIKit
 final class OnscreenControlsOverlay: UIView {
     // SNES bits (must match include/snesonline/InputBits.h)
     private enum SNES {
-        static let A: UInt16 = 1 << 0
-        static let B: UInt16 = 1 << 1
-        static let X: UInt16 = 1 << 2
-        static let Y: UInt16 = 1 << 3
-        static let L: UInt16 = 1 << 4
-        static let R: UInt16 = 1 << 5
-        static let Start: UInt16 = 1 << 6
-        static let Select: UInt16 = 1 << 7
-        static let Up: UInt16 = 1 << 8
-        static let Down: UInt16 = 1 << 9
-        static let Left: UInt16 = 1 << 10
-        static let Right: UInt16 = 1 << 11
+        static let B: UInt16 = 1 << 0
+        static let Y: UInt16 = 1 << 1
+        static let Select: UInt16 = 1 << 2
+        static let Start: UInt16 = 1 << 3
+        static let Up: UInt16 = 1 << 4
+        static let Down: UInt16 = 1 << 5
+        static let Left: UInt16 = 1 << 6
+        static let Right: UInt16 = 1 << 7
+        static let A: UInt16 = 1 << 8
+        static let X: UInt16 = 1 << 9
+        static let L: UInt16 = 1 << 10
+        static let R: UInt16 = 1 << 11
     }
 
-    private var mask: UInt16 = 0 {
-        didSet { onMaskChanged?(mask) }
+    private var inputMask: UInt16 = 0 {
+        didSet { onMaskChanged?(inputMask) }
     }
 
     var onMaskChanged: ((UInt16) -> Void)?
@@ -35,6 +35,9 @@ final class OnscreenControlsOverlay: UIView {
     private let select = UIButton(type: .system)
     private let l = UIButton(type: .system)
     private let r = UIButton(type: .system)
+
+    // Track touches for the dpad region.
+    private var dpadTouches: [ObjectIdentifier: CGPoint] = [:]
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -98,18 +101,18 @@ final class OnscreenControlsOverlay: UIView {
 
     @objc private func btnDown(_ sender: UIButton) {
         let bit = bitForButton(sender)
-        mask |= bit
+        inputMask |= bit
     }
 
     @objc private func btnUp(_ sender: UIButton) {
         let bit = bitForButton(sender)
-        mask &= ~bit
+        inputMask &= ~bit
     }
 
-    private func bitForButton(_ b: UIButton) -> UInt16 {
-        switch b {
+    private func bitForButton(_ button: UIButton) -> UInt16 {
+        switch button {
         case a: return SNES.A
-        case b: return SNES.B
+        case self.b: return SNES.B
         case x: return SNES.X
         case y: return SNES.Y
         case l: return SNES.L
@@ -122,31 +125,41 @@ final class OnscreenControlsOverlay: UIView {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesBegan(touches, with: event)
-        updateDpad(touches)
+        updateDpadTouches(touches, remove: false)
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesMoved(touches, with: event)
-        updateDpad(touches)
+        updateDpadTouches(touches, remove: false)
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesEnded(touches, with: event)
-        clearDpadIfNeeded()
+        updateDpadTouches(touches, remove: true)
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesCancelled(touches, with: event)
-        clearDpadIfNeeded()
+        updateDpadTouches(touches, remove: true)
     }
 
-    private func updateDpad(_ touches: Set<UITouch>) {
-        // Use any touch that is inside the dpad rect.
+    private func updateDpadTouches(_ touches: Set<UITouch>, remove: Bool) {
+        for t in touches {
+            let id = ObjectIdentifier(t)
+            if remove {
+                dpadTouches.removeValue(forKey: id)
+            } else {
+                dpadTouches[id] = t.location(in: self)
+            }
+        }
+        recomputeDpadMask()
+    }
+
+    private func recomputeDpadMask() {
         var any = false
         var dirMask: UInt16 = 0
 
-        for t in (eventTouches() ?? touches) {
-            let p = t.location(in: self)
+        for (_, p) in dpadTouches {
             if dpad.frame.contains(p) {
                 any = true
                 let cx = dpad.frame.midX
@@ -162,25 +175,7 @@ final class OnscreenControlsOverlay: UIView {
             }
         }
 
-        // Replace dpad bits.
-        mask &= ~(SNES.Up | SNES.Down | SNES.Left | SNES.Right)
-        if any { mask |= dirMask }
-    }
-
-    private func clearDpadIfNeeded() {
-        // If there is no remaining touch on dpad, clear dpad bits.
-        var still = false
-        for t in eventTouches() ?? [] {
-            let p = t.location(in: self)
-            if dpad.frame.contains(p) { still = true; break }
-        }
-        if !still {
-            mask &= ~(SNES.Up | SNES.Down | SNES.Left | SNES.Right)
-        }
-    }
-
-    private func eventTouches() -> Set<UITouch>? {
-        // Not directly accessible; rely on current touches via gesture system.
-        return nil
+        inputMask &= ~(SNES.Up | SNES.Down | SNES.Left | SNES.Right)
+        if any { inputMask |= dirMask }
     }
 }

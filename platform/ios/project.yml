@@ -1,6 +1,9 @@
 name: SnesOnline
 options:
   bundleIdPrefix: com.snesonline
+  # Pin the generated .xcodeproj format to Xcode 15.x so GitHub Actions
+  # macos-14 runners (Xcode 15.4) can open it.
+  xcodeVersion: "15.4"
   deploymentTarget:
     iOS: "14.0"
 settings:
@@ -8,8 +11,10 @@ settings:
     SWIFT_VERSION: 5.0
     CLANG_CXX_LANGUAGE_STANDARD: "c++17"
     CLANG_CXX_LIBRARY: "libc++"
+    SWIFT_OBJC_BRIDGING_HEADER: app/Sources/SnesOnline-Bridging-Header.h
     HEADER_SEARCH_PATHS:
       - "$(SRCROOT)/../../include"
+      - "$(SRCROOT)/.."
     OTHER_CPLUSPLUSFLAGS:
       - "-std=c++17"
 
@@ -19,8 +24,13 @@ targets:
     platform: iOS
     settings:
       base:
+        PRODUCT_NAME: SnesOnline
+        EXECUTABLE_NAME: "$(PRODUCT_NAME)"
+        WRAPPER_NAME: "$(PRODUCT_NAME).app"
         PRODUCT_BUNDLE_IDENTIFIER: com.snesonline.snesonline
         INFOPLIST_FILE: app/Info.plist
+        ALWAYS_SEARCH_USER_PATHS: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         LD_RUNPATH_SEARCH_PATHS:
           - "$(inherited)"
           - "@executable_path/Frameworks"
@@ -33,6 +43,8 @@ targets:
           - SNESOnlineIOSNative.mm
       - path: ../../src
       - path: ../../include
-        type: folder
-    resources:
       - path: app/Resources
+        buildPhase: resources
+        type: folder
+      - path: app/Assets.xcassets
+        buildPhase: resources

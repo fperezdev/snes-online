@@ -187,9 +187,9 @@ bool stunDiscoverMappedAddress(const char* stunHost, uint16_t stunPort, uint16_t
     randomBytes(hdr.txid, sizeof(hdr.txid));
     std::memcpy(req.data(), &hdr, sizeof(hdr));
 
-    const int sent = ::sendto(s, reinterpret_cast<const char*>(req.data()), static_cast<int>(req.size()), 0,
-                              reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
-    if (sent != static_cast<int>(req.size())) {
+    const auto sent = ::sendto(s, reinterpret_cast<const char*>(req.data()), static_cast<int>(req.size()), 0,
+                               reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+    if (sent < 0 || static_cast<size_t>(sent) != req.size()) {
         closesock(s);
         return false;
     }
@@ -198,16 +198,16 @@ bool stunDiscoverMappedAddress(const char* stunHost, uint16_t stunPort, uint16_t
     sockaddr_in from{};
 #if defined(_WIN32)
     int fromLen = sizeof(from);
-    const int n = ::recvfrom(s, reinterpret_cast<char*>(resp.data()), static_cast<int>(resp.size()), 0,
-                             reinterpret_cast<sockaddr*>(&from), &fromLen);
+    const auto n = ::recvfrom(s, reinterpret_cast<char*>(resp.data()), static_cast<int>(resp.size()), 0,
+                              reinterpret_cast<sockaddr*>(&from), &fromLen);
 #else
     socklen_t fromLen = sizeof(from);
-    const int n = ::recvfrom(s, resp.data(), resp.size(), 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
+    const auto n = ::recvfrom(s, resp.data(), resp.size(), 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
 #endif
 
     closesock(s);
 
-    if (n < static_cast<int>(sizeof(StunHeader))) return false;
+    if (n < static_cast<decltype(n)>(sizeof(StunHeader))) return false;
 
     StunHeader rh{};
     std::memcpy(&rh, resp.data(), sizeof(StunHeader));
@@ -220,7 +220,7 @@ bool stunDiscoverMappedAddress(const char* stunHost, uint16_t stunPort, uint16_t
     if (cookie != kStunMagicCookie) return false;
     if (std::memcmp(rh.txid, hdr.txid, sizeof(hdr.txid)) != 0) return false;
 
-    const int total = static_cast<int>(sizeof(StunHeader)) + static_cast<int>(len);
+    const auto total = static_cast<decltype(n)>(sizeof(StunHeader)) + static_cast<decltype(n)>(len);
     if (total > n) return false;
 
     // Parse attributes.

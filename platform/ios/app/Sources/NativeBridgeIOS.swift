@@ -5,21 +5,37 @@ import Foundation
 final class NativeBridgeIOS {
     static func initialize(corePath: String,
                            romPath: String,
+                           statePath: String,
+                           savePath: String,
                            enableNetplay: Bool,
                            remoteHost: String,
                            remotePort: Int,
                            localPort: Int,
-                           localPlayerNum: Int) -> Bool {
+                           localPlayerNum: Int,
+                           roomServerUrl: String,
+                           roomCode: String) -> Bool {
         return corePath.withCString { coreC in
             return romPath.withCString { romC in
-                return remoteHost.withCString { hostC in
-                    snesonline_ios_initialize(coreC,
-                                             romC,
-                                             enableNetplay,
-                                             hostC,
-                                             Int32(remotePort),
-                                             Int32(localPort),
-                                             Int32(localPlayerNum))
+                return statePath.withCString { stateC in
+                    return savePath.withCString { saveC in
+                        return remoteHost.withCString { hostC in
+                            return roomServerUrl.withCString { roomUrlC in
+                                return roomCode.withCString { roomCodeC in
+                                    snesonline_ios_initialize(coreC,
+                                                             romC,
+                                                             stateC,
+                                                             saveC,
+                                                             enableNetplay,
+                                                             hostC,
+                                                             Int32(remotePort),
+                                                             Int32(localPort),
+                                                             Int32(localPlayerNum),
+                                                             roomUrlC,
+                                                             roomCodeC)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -35,6 +51,31 @@ final class NativeBridgeIOS {
 
     static func stopLoop() {
         snesonline_ios_stop_loop()
+    }
+
+    static func setPaused(_ paused: Bool) {
+        snesonline_ios_set_paused(paused)
+    }
+
+    static func saveState(toPath path: String) -> Bool {
+        return path.withCString { p in
+            snesonline_ios_save_state_to_file(p)
+        }
+    }
+
+    static func loadState(fromPath path: String) -> Bool {
+        return path.withCString { p in
+            snesonline_ios_load_state_from_file(p)
+        }
+    }
+
+    static func stunPublicUdpPort(localPort: Int) -> Int {
+        return Int(snesonline_ios_stun_public_udp_port(Int32(localPort)))
+    }
+
+    static func stunMappedAddress(localPort: Int) -> String {
+        guard let cstr = snesonline_ios_stun_mapped_address(Int32(localPort)) else { return "" }
+        return String(cString: cstr)
     }
 
     static func setLocalInputMask(_ mask: UInt16) {

@@ -7,21 +7,39 @@
 extern "C" {
 #endif
 
-// 0=off, 1=connecting (no peer), 2=waiting (missing inputs), 3=ok
+// Netplay status:
+// 0=off, 1=connecting (no peer yet), 2=waiting (peer but missing inputs), 3=ok, 4=syncing state
 int snesonline_ios_get_netplay_status(void);
 
 bool snesonline_ios_initialize(const char* corePath,
                               const char* romPath,
+                              const char* statePath,
+                              const char* savePath,
                               bool enableNetplay,
                               const char* remoteHost,
                               int remotePort,
                               int localPort,
-                              int localPlayerNum);
+                              int localPlayerNum,
+                              const char* roomServerUrl,
+                              const char* roomCode);
 
 void snesonline_ios_shutdown(void);
 
 void snesonline_ios_start_loop(void);
 void snesonline_ios_stop_loop(void);
+
+// Pause emulation (loop keeps running to allow netplay state sync).
+void snesonline_ios_set_paused(bool paused);
+
+// Save states (host-only in netplay).
+bool snesonline_ios_save_state_to_file(const char* statePath);
+bool snesonline_ios_load_state_from_file(const char* statePath);
+
+// Networking helpers (STUN)
+int snesonline_ios_stun_public_udp_port(int localPort);
+// Returns a best-effort mapped address as "ip:port" ("" on failure).
+// Pointer remains valid until the next call on this thread.
+const char* snesonline_ios_stun_mapped_address(int localPort);
 
 // Input mask is SNES bits (see include/snesonline/InputBits.h)
 void snesonline_ios_set_local_input_mask(uint16_t mask);

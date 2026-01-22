@@ -1,0 +1,756 @@
+name: "iOS: Build IPA"
+
+on:
+  workflow_dispatch:
+    inputs:
+      export_method:
+        description: "Export method (ad-hoc, development, app-store)"
+        required: false
+        default: "ad-hoc"
+      include_core:
+        description: "Build and bundle iOS libretro core (recommended)"
+        required: false
+        default: "true"
+  push:
+    tags:
+      - "ios-v*"
+
+jobs:
+  build-ipa:
+    runs-on: macos-14
+    permissions:
+      contents: write
+      actions: read
+
+    concurrency:
+      group: ios-ipa-${{ github.ref }}
+      cancel-in-progress: true
+
+    env:
+      CONFIGURATION: Release
+      SCHEME: SnesOnline
+      PROJECT_DIR: platform/ios
+      ARCHIVE_PATH: platform/ios/build/SnesOnline.xcarchive
+      EXPORT_PATH: platform/ios/build/export
+      DEFAULT_BUNDLE_ID: com.snesonline.snesonline
+      DERIVED_DATA_PATH: ${{ github.workspace }}/platform/ios/build/DerivedData
+
+      # Pin XcodeGen to a pre-Xcode-16 release. Newer XcodeGen versions generate
+      # Xcode 16 project file format (objectVersion 77) which Xcode 15.x can't open.
+      XCODEGEN_VERSION: 2.43.0
+
+      IOS_EXPORT_METHOD: ${{ inputs.export_method || 'ad-hoc' }}
+      INCLUDE_CORE: ${{ inputs.include_core || 'true' }}
+      # Official prebuilt core download (ios-arm64)
+      LIBRETRO_IOS_CORE_ZIP_URL: https://buildbot.libretro.com/nightly/apple/ios-arm64/latest/snes9x_libretro_ios.dylib.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Generate iOS AppIcon assets
+        run: |
+          set -euo pipefail
+          # Prefer the flattened launcher icon (usually includes background). The existing
+          # icons/app-icon.png can be foreground-only (mostly transparent), which looks blank on iOS.
+          SRC_PNG=""
+          for CAND in \
+            "platform/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png" \
+            "platform/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png" \
+            "platform/android/app/src/main/res/mipmap-xhdpi/ic_launcher.png" \
+            "platform/android/app/src/main/res/mipmap-hdpi/ic_launcher.png" \
+            "platform/android/app/src/main/res/mipmap-mdpi/ic_launcher.png" \
+            "platform/android/app/src/main/res/icons/app-icon.png" \
+          ; do
+            if [ -f "$CAND" ]; then
+              SRC_PNG="$CAND"
+              break
+            fi
+          done
+          if [ -z "$SRC_PNG" ]; then
+            echo "::warning::No suitable Android launcher icon PNG found; skipping icon generation."
+            exit 0
+          fi
+          echo "Using icon source: $SRC_PNG"
+
+          OUT_DIR="platform/ios/app/Assets.xcassets/AppIcon.appiconset"
+          mkdir -p "$OUT_DIR"
+
+          # Generate a 1024x1024 base icon (upscale if needed).
+          cp "$SRC_PNG" "$OUT_DIR/icon-1024.png"
+          sips -Z 1024 "$OUT_DIR/icon-1024.png" >/dev/null
+
+          # Helper: create a square PNG at px size from the base.
+          gen() { 
+            local px="$1"; local name="$2";
+            cp "$OUT_DIR/icon-1024.png" "$OUT_DIR/$name";
+            sips -Z "$px" "$OUT_DIR/$name" >/dev/null;
+          }
+
+          # iPhone
+          gen 40  icon-20@2x.png
+          gen 60  icon-20@3x.png
+          gen 58  icon-29@2x.png
+          gen 87  icon-29@3x.png
+          gen 80  icon-40@2x.png
+          gen 120 icon-40@3x.png
+          gen 120 icon-60@2x.png
+          gen 180 icon-60@3x.png
+
+          # iPad
+          gen 20  icon-20@1x.png
+          gen 40  icon-20@2x-ipad.png
+          gen 29  icon-29@1x.png
+          gen 58  icon-29@2x-ipad.png
+          gen 40  icon-40@1x.png
+          gen 80  icon-40@2x-ipad.png
+          gen 76  icon-76@1x.png
+          gen 152 icon-76@2x.png
+          gen 167 icon-83.5@2x.png
+
+          # Quick sanity check
+          echo "Generated iOS app icons:" 
+          ls -lh "$OUT_DIR" | head -n 30 || true
+
+          # Validate that every filename referenced in the asset catalog exists.
+          ICONSET_JSON="$OUT_DIR/Contents.json"
+          if [ -f "$ICONSET_JSON" ]; then
+            missing=0
+            while IFS= read -r file; do
+              if [ ! -f "$OUT_DIR/$file" ]; then
+                echo "::error::Missing AppIcon image: $OUT_DIR/$file"
+                missing=1
+              fi
+            done < <(python3 -c 'import json,sys; data=json.load(open(sys.argv[1],"r",encoding="utf-8")); print("\n".join([img["filename"] for img in data.get("images",[]) if isinstance(img,dict) and img.get("filename")]))' "$ICONSET_JSON")
+            if [ "$missing" -ne 0 ]; then
+              exit 1
+            fi
+          else
+            echo "::warning::Missing $ICONSET_JSON; AppIcon validation skipped."
+          fi
+
+      - name: Download & bundle iOS libretro core (Snes9x)
+        if: ${{ env.INCLUDE_CORE == 'true' }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="platform/ios/app/Resources/cores"
+          mkdir -p "$OUT_DIR"
+
+          rm -rf build/libretro
+          mkdir -p build/libretro
+          echo "Downloading: $LIBRETRO_IOS_CORE_ZIP_URL"
+          curl -L --fail "$LIBRETRO_IOS_CORE_ZIP_URL" -o build/libretro/snes9x_ios.zip
+          unzip -o build/libretro/snes9x_ios.zip -d build/libretro/snes9x_ios
+
+          CORE_FILE=$(find build/libretro/snes9x_ios -type f -name 'snes9x_libretro_ios.dylib' -print | head -n 1)
+          if [ -z "$CORE_FILE" ]; then
+            # fallback if buildbot changes naming
+            CORE_FILE=$(find build/libretro/snes9x_ios -type f -name '*snes9x*libretro*ios*.dylib' -print | head -n 1)
+          fi
+          if [ -z "$CORE_FILE" ]; then
+            echo "::error::Could not find snes9x iOS core dylib in the downloaded zip."
+            find build/libretro/snes9x_ios -maxdepth 2 -type f -print
+            exit 1
+          fi
+
+          echo "Bundling core: $CORE_FILE"
+          cp -f "$CORE_FILE" "$OUT_DIR/snes9x_libretro_ios.dylib"
+
+      - name: Warn if iOS libretro core missing
+        if: ${{ env.INCLUDE_CORE != 'true' }}
+        run: |
+          CORE_PATH="platform/ios/app/Resources/cores/snes9x_libretro_ios.dylib"
+          if [ ! -f "$CORE_PATH" ]; then
+            echo "::warning::Missing $CORE_PATH (app will build, but core loading will fail at runtime)."
+          fi
+
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          echo "Downloading XcodeGen $XCODEGEN_VERSION"
+          curl -L --fail "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip" -o /tmp/xcodegen.zip
+          rm -rf /tmp/xcodegen
+          mkdir -p /tmp/xcodegen
+          unzip -o /tmp/xcodegen.zip -d /tmp/xcodegen
+          rm -rf "$HOME/.local/bin/xcodegen"
+          mv /tmp/xcodegen/xcodegen/bin/xcodegen "$HOME/.local/bin/xcodegen"
+          chmod +x "$HOME/.local/bin/xcodegen"
+          "$HOME/.local/bin/xcodegen" --version
+
+      - name: Generate Xcode project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          rm -rf SnesOnline.xcodeproj
+          "$HOME/.local/bin/xcodegen" generate
+
+      - name: Inspect generated Xcode project (bundle id)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          PBXPROJ="SnesOnline.xcodeproj/project.pbxproj"
+          if [ ! -f "$PBXPROJ" ]; then
+            echo "::error::Missing generated project file: $PBXPROJ"
+            exit 1
+          fi
+          echo "--- project.pbxproj (first 80 bundle-id related lines) ---"
+          grep -nE "(PRODUCT_BUNDLE_IDENTIFIER|INFOPLIST_FILE)" "$PBXPROJ" | head -n 80 || true
+
+      - name: Determine signing mode
+        id: signmode
+        env:
+          IOS_CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+          IOS_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+          IOS_PROFILE_NAME: ${{ secrets.IOS_PROFILE_NAME }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in \
+            IOS_CERT_P12_BASE64 \
+            IOS_CERT_PASSWORD \
+            IOS_PROVISION_PROFILE_BASE64 \
+            IOS_KEYCHAIN_PASSWORD \
+            IOS_TEAM_ID \
+            IOS_BUNDLE_ID \
+            IOS_PROFILE_NAME \
+          ; do
+            if [ -z "${!v:-}" ]; then
+              missing+=("$v")
+            fi
+          done
+
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "mode=signed" >> "$GITHUB_OUTPUT"
+            echo "Using SIGNED IPA mode."
+          else
+            echo "mode=unsigned" >> "$GITHUB_OUTPUT"
+            echo "::notice::Using UNSIGNED IPA mode (for AltStore/Sideloadly)."
+            echo "::notice::Signed mode requires these secrets: IOS_CERT_P12_BASE64, IOS_CERT_PASSWORD, IOS_PROVISION_PROFILE_BASE64, IOS_KEYCHAIN_PASSWORD, IOS_TEAM_ID, IOS_BUNDLE_ID, IOS_PROFILE_NAME"
+            echo "::notice::Missing: ${missing[*]}"
+          fi
+
+      - name: Ensure bundle identifier (Info.plist)
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          MODE: ${{ steps.signmode.outputs.mode }}
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+        run: |
+          set -euo pipefail
+          PLIST="app/Info.plist"
+          if [ ! -f "$PLIST" ]; then
+            echo "::error::Missing Info.plist at $PLIST"
+            exit 1
+          fi
+
+          BUNDLE_ID="$DEFAULT_BUNDLE_ID"
+          if [ "${MODE}" = "signed" ] && [ -n "${IOS_BUNDLE_ID:-}" ]; then
+            BUNDLE_ID="$IOS_BUNDLE_ID"
+          fi
+
+          # Ensure the Info.plist has a concrete CFBundleIdentifier value. Some Xcode
+          # archive paths fail early if this expands to an empty string.
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$PLIST" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $BUNDLE_ID" "$PLIST"
+
+          echo "CFBundleIdentifier now: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")"
+
+      - name: Debug build settings (bundle identifier)
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          MODE: ${{ steps.signmode.outputs.mode }}
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+
+          BUNDLE_ID="$DEFAULT_BUNDLE_ID"
+          if [ "${MODE}" = "signed" ] && [ -n "${IOS_BUNDLE_ID:-}" ]; then
+            BUNDLE_ID="$IOS_BUNDLE_ID"
+          fi
+
+          xcodebuild \
+              -project SnesOnline.xcodeproj \
+              -scheme "$SCHEME" \
+              -configuration "$CONFIGURATION" \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath "$DERIVED_DATA_PATH" \
+              -showBuildSettings \
+              PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+              INFOPLIST_FILE=app/Info.plist \
+            | tee build/xcodebuild-buildsettings.log
+
+          BID=$(awk -F' = ' '/^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER[[:space:]]*=/{print $2; exit}' build/xcodebuild-buildsettings.log | tr -d '\r')
+          echo "Resolved PRODUCT_BUNDLE_IDENTIFIER: '${BID}' (mode=${MODE})"
+          if [ -z "${BID}" ]; then
+            echo "::error::PRODUCT_BUNDLE_IDENTIFIER is empty in generated build settings."
+            echo "::error::Check platform/ios/project.yml and XcodeGen output."
+            exit 1
+          fi
+
+      - name: Decode signing assets
+        if: ${{ steps.signmode.outputs.mode == 'signed' }}
+        env:
+          IOS_CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+        run: |
+          mkdir -p signing
+          echo "$IOS_CERT_P12_BASE64" | base64 --decode > signing/cert.p12
+          echo "$IOS_PROVISION_PROFILE_BASE64" | base64 --decode > signing/profile.mobileprovision
+
+      - name: Install signing certificate + provisioning profile
+        if: ${{ steps.signmode.outputs.mode == 'signed' }}
+        env:
+          IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+          IOS_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN=build.keychain
+          security create-keychain -p "$IOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$IOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          security import signing/cert.p12 -k "$KEYCHAIN" -P "$IOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$IOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          UUID=$(security cms -D -i signing/profile.mobileprovision | /usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin)
+          cp signing/profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+
+      - name: Build (UNSIGNED)
+        id: build_unsigned
+        if: ${{ steps.signmode.outputs.mode == 'unsigned' }}
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild \
+              -project SnesOnline.xcodeproj \
+              -scheme "$SCHEME" \
+              -configuration "$CONFIGURATION" \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath "$DERIVED_DATA_PATH" \
+              -resultBundlePath "build/SnesOnline.xcresult" \
+              build \
+              PRODUCT_BUNDLE_IDENTIFIER="$DEFAULT_BUNDLE_ID" \
+              INFOPLIST_FILE=app/Info.plist \
+              INFOPLIST_EXPAND_BUILD_SETTINGS=YES \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+            | tee build/xcodebuild-build.log
+
+      - name: Dump bundle identifiers in built app (debug)
+        if: ${{ steps.build_unsigned.outcome == 'failure' }}
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          echo "DERIVED_DATA_PATH: $DERIVED_DATA_PATH"
+
+          APP_DIR="$DERIVED_DATA_PATH/Build/Products/${CONFIGURATION}-iphoneos/${SCHEME}.app"
+
+          # Fallback for older layouts / if config differs.
+          if [ ! -d "$APP_DIR" ]; then
+            APP_DIR=$(find "$DERIVED_DATA_PATH/Build/Products" -maxdepth 3 -type d -name "*.app" -print -quit 2>/dev/null || true)
+          fi
+
+          if [ -z "$APP_DIR" ]; then
+            echo "Built app not found in archive or DERIVED_DATA_PATH; trying default Xcode DerivedData"
+            DEFAULT_DD="$HOME/Library/Developer/Xcode/DerivedData"
+            if [ -d "$DEFAULT_DD" ]; then
+              APP_DIR=$(find "$DEFAULT_DD" -type d -path "*/ArchiveIntermediates/*/InstallationBuildProductsLocation/Applications/*.app" -print -quit 2>/dev/null || true)
+            fi
+          fi
+
+          if [ -z "$APP_DIR" ] || [ ! -d "$APP_DIR" ]; then
+            echo "Could not locate built .app bundle. Listing candidates under $DERIVED_DATA_PATH (if any):"
+            find "$DERIVED_DATA_PATH" -type d -name '*.app' -maxdepth 12 -print | head -n 80 || true
+            echo "Listing candidates under $HOME/Library/Developer/Xcode/DerivedData (if any):"
+            find "$HOME/Library/Developer/Xcode/DerivedData" -type d -name '*.app' -maxdepth 6 -print 2>/dev/null | head -n 80 || true
+            exit 0
+          fi
+
+          echo "Inspecting built app at: $APP_DIR"
+
+          echo "--- CFBundleIdentifier values under built .app ---"
+          while IFS= read -r plist; do
+            bundle_dir=$(dirname "$plist")
+            bid=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist" 2>/dev/null || true)
+            if [ -z "$bid" ]; then
+              echo "MISSING CFBundleIdentifier -> $bundle_dir"
+            else
+              echo "$bid -> $bundle_dir"
+            fi
+          done < <(find "$APP_DIR" \( -name Info.plist -o -name info.plist \) -print | sort)
+
+      - name: Dump xcarchive Info.plist (debug)
+        if: ${{ steps.build_unsigned.outcome == 'failure' }}
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          PLIST="build/SnesOnline.xcarchive/Info.plist"
+          if [ ! -f "$PLIST" ]; then
+            echo "No xcarchive Info.plist found at $PLIST"
+            ls -la build/SnesOnline.xcarchive || true
+            exit 0
+          fi
+
+          echo "--- build/SnesOnline.xcarchive/Info.plist summary ---"
+          /usr/libexec/PlistBuddy -c 'Print :ApplicationProperties' "$PLIST" 2>/dev/null || true
+          echo "Archive ApplicationProperties:CFBundleIdentifier = $(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleIdentifier' "$PLIST" 2>/dev/null || true)"
+          echo "Archive ApplicationProperties:BundleIdentifier = $(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:BundleIdentifier' "$PLIST" 2>/dev/null || true)"
+          echo "Archive ApplicationPath = $(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:ApplicationPath' "$PLIST" 2>/dev/null || true)"
+          echo "Archive Name = $(/usr/libexec/PlistBuddy -c 'Print :Name' "$PLIST" 2>/dev/null || true)"
+
+      - name: Print build errors (xcresult)
+        if: ${{ steps.build_unsigned.outcome == 'failure' }}
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          if [ ! -d "build/SnesOnline.xcresult" ]; then
+            echo "No xcresult bundle found at build/SnesOnline.xcresult"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          p = subprocess.run(
+              ['xcrun', 'xcresulttool', 'get', '--path', 'build/SnesOnline.xcresult', '--format', 'json'],
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              text=True,
+          )
+          if p.returncode != 0:
+              print(p.stdout)
+              sys.exit(0)
+
+          data = json.loads(p.stdout)
+          msgs = []
+
+          def type_name(t):
+              if isinstance(t, str):
+                  return t
+              if isinstance(t, dict):
+                  for k in ("_name", "_value"):
+                      v = t.get(k)
+                      if isinstance(v, str):
+                          return v
+              return ""
+
+          def walk(obj):
+              if isinstance(obj, dict):
+                  tn = type_name(obj.get('_type'))
+                  if tn.endswith('IssueSummary'):
+                      msg = obj.get('message', {}).get('_value') if isinstance(obj.get('message'), dict) else None
+                      if msg:
+                          file = None
+                          loc = obj.get('documentLocationInCreatingWorkspace')
+                          if isinstance(loc, dict):
+                              url = loc.get('url')
+                              if isinstance(url, dict):
+                                  file = url.get('_value')
+                          msgs.append(f"{msg} ({file})" if file else msg)
+                  for v in obj.values():
+                      walk(v)
+              elif isinstance(obj, list):
+                  for v in obj:
+                      walk(v)
+
+          walk(data)
+          if not msgs:
+              print('xcresult parsed but no IssueSummary found.')
+              sys.exit(0)
+
+          print('--- xcresult issues ---')
+          for m in msgs[:120]:
+              print(m)
+          PY
+
+      - name: Show xcodebuild log tail (debug)
+        if: ${{ steps.build_unsigned.outcome == 'failure' }}
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "build/xcodebuild-build.log" ]; then
+            echo "No build/xcodebuild-build.log found"
+            exit 0
+          fi
+          echo "--- last 200 lines of xcodebuild output ---"
+          tail -n 200 build/xcodebuild-build.log || true
+          echo "--- first 80 'error:' lines (if any) ---"
+          grep -n "^.*error:.*$" build/xcodebuild-build.log | head -n 80 || true
+
+      - name: Upload xcodebuild log (debug)
+        if: ${{ steps.build_unsigned.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-xcodebuild-log
+          path: platform/ios/build/xcodebuild-build.log
+          if-no-files-found: ignore
+
+      - name: Upload xcresult (debug)
+        if: ${{ steps.build_unsigned.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-xcresult
+          path: platform/ios/build/SnesOnline.xcresult
+          if-no-files-found: ignore
+
+      - name: Fail job if archive failed
+        if: ${{ steps.build_unsigned.outcome == 'failure' }}
+        run: exit 1
+
+      - name: Validate bundled core in build product (UNSIGNED)
+        if: ${{ env.INCLUDE_CORE == 'true' && steps.signmode.outputs.mode == 'unsigned' && steps.build_unsigned.outcome == 'success' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          APP_DIR="$DERIVED_DATA_PATH/Build/Products/${CONFIGURATION}-iphoneos/${SCHEME}.app"
+          if [ ! -d "$APP_DIR" ]; then
+            echo "::error::Built app directory not found: $APP_DIR"
+            echo "Listing $DERIVED_DATA_PATH/Build/Products (if any):"
+            ls -la "$DERIVED_DATA_PATH/Build/Products" || true
+            exit 1
+          fi
+          FOUND=$(find "$APP_DIR" -maxdepth 5 -name 'snes9x_libretro_ios.dylib' -print | head -n 1 || true)
+          if [ -z "$FOUND" ]; then
+            echo "::error::Core dylib not found in archive (.app)."
+            echo "Top-level .app contents:"
+            ls -la "$APP_DIR" || true
+            echo "Searching for any dylib files:"
+            find "$APP_DIR" -maxdepth 5 -name '*.dylib' -print || true
+            exit 1
+          fi
+          echo "Found core dylib at: $FOUND"
+
+      - name: Package UNSIGNED IPA (for AltStore/Sideloadly)
+        if: ${{ steps.signmode.outputs.mode == 'unsigned' && steps.build_unsigned.outcome == 'success' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/export
+          APP_PATH="$DERIVED_DATA_PATH/Build/Products/${CONFIGURATION}-iphoneos/${SCHEME}.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::Could not find built .app at: $APP_PATH"
+            echo "Candidates under $DERIVED_DATA_PATH/Build/Products:"
+            find "$DERIVED_DATA_PATH/Build/Products" -maxdepth 3 -type d -name "*.app" -print | head -n 20 || true
+            exit 1
+          fi
+          rm -rf Payload
+          mkdir -p Payload
+
+          # Use ditto to preserve bundle metadata/permissions.
+          ditto "$APP_PATH" "Payload/$(basename "$APP_PATH")"
+
+          # AltStore/AltSign can reject IPAs that contain executable code in unusual locations.
+          # Move the bundled core dylib into the standard Frameworks/ directory.
+          DEST_APP="Payload/$(basename "$APP_PATH")"
+          if [ -f "$DEST_APP/Resources/cores/snes9x_libretro_ios.dylib" ]; then
+            mkdir -p "$DEST_APP/Frameworks"
+            mv -f "$DEST_APP/Resources/cores/snes9x_libretro_ios.dylib" "$DEST_APP/Frameworks/snes9x_libretro_ios.dylib"
+            rm -f "$DEST_APP/Resources/cores/.gitkeep" || true
+            rmdir "$DEST_APP/Resources/cores" 2>/dev/null || true
+            rmdir "$DEST_APP/Resources" 2>/dev/null || true
+          fi
+
+          echo "App bundle top-level contents (post-fix):"
+          ls -la "$DEST_APP" | head -n 80 || true
+          if [ -d "$DEST_APP/Frameworks" ]; then
+            echo "Frameworks contents:"
+            ls -la "$DEST_APP/Frameworks" | head -n 80 || true
+          fi
+
+          OUT_IPA="build/export/SnesOnline-unsigned.ipa"
+          rm -f "$OUT_IPA"
+
+          # Create a standard IPA (zip) containing a top-level Payload/ directory.
+          # AltStore is often stricter about zip structure than macOS tools.
+          /usr/bin/zip -qry "$OUT_IPA" Payload
+
+          echo "IPA written:"
+          ls -lh "$OUT_IPA" || true
+          echo "IPA file type:"
+          file "$OUT_IPA" || true
+
+          echo "Top of IPA contents:"
+          unzip -l "$OUT_IPA" | head -n 80 || true
+
+          echo "IPA permissions preview (zipinfo):"
+          zipinfo -l "$OUT_IPA" | head -n 40 || true
+
+          # AltStore expects: Payload/<AppName>.app/Info.plist
+          if ! unzip -l "$OUT_IPA" | grep -E "Payload/[^/]+\.app/Info\.plist$" >/dev/null; then
+            echo "::error::IPA structure invalid for AltStore (missing Payload/<App>.app/Info.plist)."
+            echo "::error::Full IPA listing (first 400 lines):"
+            unzip -l "$OUT_IPA" | head -n 400 || true
+            exit 1
+          fi
+
+          # Sanity check by extracting and verifying the app bundle exists on disk.
+          rm -rf build/ipa_check
+          mkdir -p build/ipa_check
+          unzip -q "$OUT_IPA" -d build/ipa_check
+          if [ ! -d "build/ipa_check/Payload/${SCHEME}.app" ]; then
+            echo "::error::Extracted IPA does not contain Payload/${SCHEME}.app on disk."
+            echo "Extracted Payload directory listing:"
+            ls -la build/ipa_check/Payload || true
+            exit 1
+          fi
+          if [ ! -f "build/ipa_check/Payload/${SCHEME}.app/Info.plist" ]; then
+            echo "::error::Extracted app bundle missing Info.plist."
+            ls -la "build/ipa_check/Payload/${SCHEME}.app" || true
+            exit 1
+          fi
+
+          echo "--- Extracted Info.plist key summary (AltStore sanity) ---"
+          PLIST="build/ipa_check/Payload/${SCHEME}.app/Info.plist"
+          EXEC=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST" 2>/dev/null || true)
+          BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST" 2>/dev/null || true)
+          PKG=$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$PLIST" 2>/dev/null || true)
+          echo "CFBundleExecutable=$EXEC"
+          echo "CFBundleIdentifier=$BID"
+          echo "CFBundlePackageType=$PKG"
+
+          # AltStore expects concrete values (no build-setting placeholders) and a matching executable.
+          if echo "$EXEC" | grep -q '\$('; then
+            echo "::error::CFBundleExecutable contains an unexpanded build setting: $EXEC"
+            exit 1
+          fi
+          if echo "$BID" | grep -q '\$('; then
+            echo "::error::CFBundleIdentifier contains an unexpanded build setting: $BID"
+            exit 1
+          fi
+          if [ -z "$EXEC" ] || [ -z "$BID" ] || [ -z "$PKG" ]; then
+            echo "::error::Info.plist missing required keys for an app bundle."
+            exit 1
+          fi
+          if [ ! -f "build/ipa_check/Payload/${SCHEME}.app/$EXEC" ]; then
+            echo "::error::App executable not found at build/ipa_check/Payload/${SCHEME}.app/$EXEC"
+            echo "App bundle contents:"
+            ls -la "build/ipa_check/Payload/${SCHEME}.app" || true
+            exit 1
+          fi
+          echo "::notice::Extracted IPA looks OK on disk."
+
+          echo "::notice::IPA structure looks OK (Payload/<App>.app found)."
+
+      - name: Archive (SIGNED)
+        if: ${{ steps.signmode.outputs.mode == 'signed' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+          IOS_PROFILE_NAME: ${{ secrets.IOS_PROFILE_NAME }}
+        run: |
+          mkdir -p build
+          if [ -z "${IOS_BUNDLE_ID:-}" ]; then
+            echo "::error::IOS_BUNDLE_ID secret is missing/empty; xcodebuild cannot archive without a bundle identifier."
+            exit 1
+          fi
+          xcodebuild \
+            -project SnesOnline.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            -archivePath "build/SnesOnline.xcarchive" \
+            -resultBundlePath "build/SnesOnline.xcresult" \
+            archive \
+            PRODUCT_BUNDLE_IDENTIFIER="$IOS_BUNDLE_ID" \
+            INFOPLIST_FILE=app/Info.plist \
+            DEVELOPMENT_TEAM="$IOS_TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER="$IOS_PROFILE_NAME"
+
+      - name: Validate bundled core in archive (SIGNED)
+        if: ${{ env.INCLUDE_CORE == 'true' && steps.signmode.outputs.mode == 'signed' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          APP_DIR="build/SnesOnline.xcarchive/Products/Applications/SnesOnline.app"
+          if [ ! -d "$APP_DIR" ]; then
+            echo "::error::Archive app directory not found: $APP_DIR"
+            ls -la "build/SnesOnline.xcarchive/Products/Applications" || true
+            exit 1
+          fi
+          FOUND=$(find "$APP_DIR" -maxdepth 5 -name 'snes9x_libretro_ios.dylib' -print | head -n 1 || true)
+          if [ -z "$FOUND" ]; then
+            echo "::error::Core dylib not found in archive (.app)."
+            echo "Top-level .app contents:"
+            ls -la "$APP_DIR" || true
+            echo "Searching for any dylib files:"
+            find "$APP_DIR" -maxdepth 5 -name '*.dylib' -print || true
+            exit 1
+          fi
+          echo "Found core dylib at: $FOUND"
+
+      - name: Export IPA (SIGNED)
+        if: ${{ steps.signmode.outputs.mode == 'signed' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+          IOS_PROFILE_NAME: ${{ secrets.IOS_PROFILE_NAME }}
+        run: |
+          cat > ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>${IOS_EXPORT_METHOD}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>${IOS_TEAM_ID}</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${IOS_BUNDLE_ID}</key>
+              <string>${IOS_PROFILE_NAME}</string>
+            </dict>
+            <key>compileBitcode</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+
+          mkdir -p build/export
+          xcodebuild -exportArchive \
+            -archivePath "build/SnesOnline.xcarchive" \
+            -exportPath "build/export" \
+            -exportOptionsPlist ExportOptions.plist
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Note: GitHub artifacts are always downloaded as a .zip.
+          # Naming this "*.ipa" is confusing and can lead to uploading the zip to AltStore.
+          name: SnesOnline-${{ github.sha }}-ipa-artifact
+          path: platform/ios/build/export/*.ipa
+          retention-days: 7
+
+      - name: Publish GitHub Release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/ios-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: platform/ios/build/export/*.ipa

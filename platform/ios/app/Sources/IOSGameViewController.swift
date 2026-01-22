@@ -3,6 +3,22 @@ import AVFoundation
 import GameController
 
 final class IOSGameViewController: UIViewController {
+    // Must match include/snesonline/InputBits.h
+    private enum SNES {
+        static let B: UInt16 = 1 << 0
+        static let Y: UInt16 = 1 << 1
+        static let Select: UInt16 = 1 << 2
+        static let Start: UInt16 = 1 << 3
+        static let Up: UInt16 = 1 << 4
+        static let Down: UInt16 = 1 << 5
+        static let Left: UInt16 = 1 << 6
+        static let Right: UInt16 = 1 << 7
+        static let A: UInt16 = 1 << 8
+        static let X: UInt16 = 1 << 9
+        static let L: UInt16 = 1 << 10
+        static let R: UInt16 = 1 << 11
+    }
+
     private let config: IOSGameConfig
 
     private let imageView = UIImageView()
@@ -19,6 +35,8 @@ final class IOSGameViewController: UIViewController {
 
     private var overlay: OnscreenControlsOverlay?
 
+    private var noVideoTicks: Int = 0
+
     init(config: IOSGameConfig) {
         self.config = config
         super.init(nibName: nil, bundle: nil)
@@ -31,6 +49,13 @@ final class IOSGameViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
+
+        if config.showSaveButton {
+            navigationItem.rightBarButtonItem = UIBarButtonItem(title: "State",
+                                                                style: .plain,
+                                                                target: self,
+                                                                action: #selector(showStateMenu))
+        }
 
         imageView.contentMode = .scaleAspectFit
         imageView.translatesAutoresizingMaskIntoConstraints = false
@@ -88,11 +113,15 @@ final class IOSGameViewController: UIViewController {
         let ok = NativeBridgeIOS.initialize(
             corePath: config.coreURL.path,
             romPath: config.romURL.path,
+            statePath: config.stateURL.path,
+            savePath: config.saveURL.path,
             enableNetplay: config.enableNetplay,
             remoteHost: config.remoteHost,
             remotePort: config.remotePort,
             localPort: config.localPort,
-            localPlayerNum: config.localPlayerNum
+            localPlayerNum: config.localPlayerNum,
+            roomServerUrl: config.roomServerUrl,
+            roomCode: config.roomCode
         )
 
         if !ok {
@@ -112,6 +141,15 @@ final class IOSGameViewController: UIViewController {
     }
 
     private func startAudio() {
+        // Best-effort: make sure audio is allowed to play.
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setActive(true)
+        } catch {
+            // Best-effort.
+        }
+
         let sampleRate = max(8000, min(192000, NativeBridgeIOS.audioSampleRateHz()))
         let engine = AVAudioEngine()
 
@@ -142,7 +180,7 @@ final class IOSGameViewController: UIViewController {
                 if gotFrames > 0 {
                     let gotShorts = gotFrames * 2
                     self.audioTmp.withUnsafeBufferPointer { src in
-                        out.assign(from: src.baseAddress!, count: gotShorts)
+                        out.update(from: src.baseAddress!, count: gotShorts)
                     }
                     // Zero remainder
                     if gotShorts < shortsWanted {
@@ -196,20 +234,24 @@ final class IOSGameViewController: UIViewController {
             let ly = pad.leftThumbstick.yAxis.value
             let dead: Float = 0.25
 
-            if lx < -dead { m |= (1 << 10) }
-            if lx > dead { m |= (1 << 11) }
-            if ly < -dead { m |= (1 << 9) }
-            if ly > dead { m |= (1 << 8) }
+            if lx < -dead { m |= SNES.Left }
+            if lx > dead { m |= SNES.Right }
+            if ly < -dead { m |= SNES.Up }
+            if ly > dead { m |= SNES.Down }
 
-            if pad.buttonA.isPressed { m |= (1 << 1) } // map A->B
-            if pad.buttonB.isPressed { m |= (1 << 0) }
-            if pad.buttonX.isPressed { m |= (1 << 3) }
-            if pad.buttonY.isPressed { m |= (1 << 2) }
+            // Typical mapping: A->B, B->A, X->Y, Y->X
+            if pad.buttonA.isPressed { m |= SNES.B }
+            if pad.buttonB.isPressed { m |= SNES.A }
+            if pad.buttonX.isPressed { m |= SNES.Y }
+            if pad.buttonY.isPressed { m |= SNES.X }
 
-            if pad.leftShoulder.isPressed { m |= (1 << 4) }
-            if pad.rightShoulder.isPressed { m |= (1 << 5) }
+            if pad.leftShoulder.isPressed { m |= SNES.L }
+            if pad.rightShoulder.isPressed { m |= SNES.R }
 
-            if pad.buttonMenu.isPressed { m |= (1 << 6) }
+            if pad.buttonMenu.isPressed { m |= SNES.Start }
+            if #available(iOS 14.0, *), pad.buttonOptions?.isPressed == true {
+                m |= SNES.Select
+            }
         }
 
         baseMask = m
@@ -222,6 +264,7 @@ final class IOSGameViewController: UIViewController {
             waitingLabel.isHidden = (st == 3)
             if st == 1 { waitingLabel.text = "WAITING FOR PEER..." }
             else if st == 2 { waitingLabel.text = "WAITING FOR INPUTS..." }
+            else if st == 4 { waitingLabel.text = "SYNCING STATE..." }
             else if st == 3 { /* hidden */ }
         } else {
             waitingLabel.isHidden = true
@@ -234,7 +277,15 @@ final class IOSGameViewController: UIViewController {
         // Render.
         let w = NativeBridgeIOS.videoWidth()
         let h = NativeBridgeIOS.videoHeight()
-        guard w > 0, h > 0, let ptr = NativeBridgeIOS.videoBufferRGBA() else { return }
+        guard w > 0, h > 0, let ptr = NativeBridgeIOS.videoBufferRGBA() else {
+            noVideoTicks += 1
+            if noVideoTicks >= 60 {
+                waitingLabel.isHidden = false
+                waitingLabel.text = "No video frames yet.\n(core running?)"
+            }
+            return
+        }
+        noVideoTicks = 0
 
         // Build CGImage from 512x512 backing buffer but crop to w/h.
         let maxW = 512
@@ -245,7 +296,12 @@ final class IOSGameViewController: UIViewController {
         guard let provider = CGDataProvider(data: data as CFData) else { return }
 
         let cs = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
+        // Native buffer is 32-bit XRGB on little-endian (bytes: B,G,R,X).
+        // Use noneSkipFirst so a 0 alpha byte doesn't make the image fully transparent.
+        let bitmapInfo: CGBitmapInfo = [
+            .byteOrder32Little,
+            CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
+        ]
 
         guard let full = CGImage(width: maxW,
                                  height: 512,
@@ -273,5 +329,60 @@ final class IOSGameViewController: UIViewController {
 
         audioEngine?.stop()
         audioEngine = nil
+    }
+
+    @objc private func showStateMenu() {
+        NativeBridgeIOS.setPaused(true)
+
+        let alert = UIAlertController(title: "State", message: nil, preferredStyle: .actionSheet)
+        alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
+            guard let self else { return }
+            let ok = NativeBridgeIOS.saveState(toPath: self.config.stateURL.path)
+            self.NativeBridgeIOS_setPausedFalseLater()
+            self.showToast(ok ? "Saved" : "Save failed")
+        })
+        alert.addAction(UIAlertAction(title: "Load", style: .default) { [weak self] _ in
+            guard let self else { return }
+            let ok = NativeBridgeIOS.loadState(fromPath: self.config.stateURL.path)
+            self.NativeBridgeIOS_setPausedFalseLater()
+            self.showToast(ok ? "Loaded" : "Load failed")
+        })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { [weak self] _ in
+            self?.NativeBridgeIOS_setPausedFalseLater()
+        })
+
+        // iPad: anchor to bar button.
+        if let pop = alert.popoverPresentationController {
+            pop.barButtonItem = navigationItem.rightBarButtonItem
+        }
+        present(alert, animated: true)
+    }
+
+    private func NativeBridgeIOS_setPausedFalseLater() {
+        // Allow one runloop tick for any sync-related netplay work.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            NativeBridgeIOS.setPaused(false)
+        }
+    }
+
+    private func showToast(_ msg: String) {
+        let l = UILabel()
+        l.text = msg
+        l.textColor = .white
+        l.backgroundColor = UIColor.black.withAlphaComponent(0.7)
+        l.textAlignment = .center
+        l.layer.cornerRadius = 10
+        l.layer.masksToBounds = true
+        l.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(l)
+        NSLayoutConstraint.activate([
+            l.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            l.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -20),
+            l.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
+            l.heightAnchor.constraint(equalToConstant: 44)
+        ])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            l.removeFromSuperview()
+        }
     }
 }

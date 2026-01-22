@@ -49,3 +49,6 @@ platform/android/.idea/
 
 # Node
 **/node_modules/
+
+# Logs
+**/*.log
