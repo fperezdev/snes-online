@@ -112,11 +112,51 @@ public class ConfigActivity extends Activity {
         int lanPort = 0;
     }
 
+    private static final class HostPort {
+        String host = "";
+        int port = 0;
+    }
+
+    // Supports:
+    // - ipv4:port
+    // - hostname:port
+    // - [ipv6]:port
+    // - (best-effort) raw ipv6 with port appended (split on last ':')
+    private static HostPort parseHostPort(String s) {
+        HostPort out = new HostPort();
+        if (s == null) return out;
+        String t = s.trim();
+        if (t.isEmpty()) return out;
+
+        try {
+            if (t.startsWith("[")) {
+                int r = t.indexOf(']');
+                if (r > 1 && r + 2 <= t.length() && t.charAt(r + 1) == ':') {
+                    out.host = t.substring(1, r);
+                    out.port = parseIntOr(t.substring(r + 2), 0);
+                    return out;
+                }
+                return out;
+            }
+
+            int lastColon = t.lastIndexOf(':');
+            if (lastColon <= 0 || lastColon + 1 >= t.length()) return out;
+            out.host = t.substring(0, lastColon);
+            out.port = parseIntOr(t.substring(lastColon + 1), 0);
+            return out;
+        } catch (Exception ignored) {
+            return out;
+        }
+    }
+
     private static String encodeConnectionCode(String publicIp, int publicPort, String lanIp, int lanPort) {
         // v=2 includes a signature so small changes (like port) noticeably change the code.
         String p = "v=2";
         if (publicIp != null && !publicIp.isEmpty() && publicPort > 0) {
-            p += "&pub=" + publicIp + ":" + publicPort;
+            String host = publicIp;
+            // Canonicalize IPv6 endpoints to bracket form.
+            if (host.contains(":") && !host.startsWith("[")) host = "[" + host + "]";
+            p += "&pub=" + host + ":" + publicPort;
         }
         if (lanIp != null && !lanIp.isEmpty() && lanPort > 0) {
             p += "&lan=" + lanIp + ":" + lanPort;
@@ -173,11 +213,9 @@ public class ConfigActivity extends Activity {
             String k = part.substring(0, eq);
             String v = part.substring(eq + 1);
             if (k.equals("pub")) {
-                String[] hp = v.split(":");
-                if (hp.length == 2) {
-                    out.publicIp = hp[0];
-                    out.publicPort = parseIntOr(hp[1], 0);
-                }
+                HostPort hp = parseHostPort(v);
+                out.publicIp = hp.host;
+                out.publicPort = hp.port;
             } else if (k.equals("lan")) {
                 String[] hp = v.split(":");
                 if (hp.length == 2) {
@@ -469,10 +507,9 @@ public class ConfigActivity extends Activity {
                     if (mapped == null || mapped.trim().isEmpty() || !mapped.contains(":")) {
                         throw new Exception("STUN failed");
                     }
-                    String[] hp = mapped.trim().split(":");
-                    if (hp.length != 2) throw new Exception("STUN returned invalid address");
-                    String pubIp = hp[0];
-                    int pubPort = parseIntOr(hp[1], 0);
+                    HostPort hp = parseHostPort(mapped);
+                    String pubIp = hp.host;
+                    int pubPort = hp.port;
                     if (pubIp.isEmpty() || pubPort < 1 || pubPort > 65535) throw new Exception("STUN returned invalid port");
 
                     String lanIp = localLanIpv4BestEffort();

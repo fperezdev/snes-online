@@ -228,7 +228,7 @@ std::thread g_loopThread;
 
 struct UdpNetplay {
     int sock = -1;
-    sockaddr_in remote{};
+    sockaddr_in6 remote{};
     uint16_t localPort = 7000;
     uint16_t remotePort = 7000;
     uint8_t localPlayerNum = 1;
@@ -259,6 +259,7 @@ struct UdpNetplay {
 
     bool hasPeer = false;
     std::chrono::steady_clock::time_point lastRecv{};
+    std::chrono::steady_clock::time_point lastKeepAliveSent{};
 
     struct Packet {
         uint32_t magic_be;
@@ -269,6 +270,7 @@ struct UdpNetplay {
 
     static constexpr uint32_t kMagicInput = 0x534E4F49u;     // 'SNOI'
     static constexpr uint32_t kMagicHash = 0x534E4F48u;      // 'SNOH'
+    static constexpr uint32_t kMagicKeepAlive = 0x534E4F4Bu; // 'SNOK'
     static constexpr uint32_t kMagicResyncReq = 0x534E4F51u; // 'SNOQ'
     static constexpr uint32_t kMagicStateInfo = 0x534E4F53u; // 'SNOS'
     static constexpr uint32_t kMagicStateChunk = 0x534E4F43u;// 'SNOC'
@@ -391,36 +393,117 @@ struct UdpNetplay {
         return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
     }
 
-    static bool resolveIpv4(const char* host, sockaddr_in& out, uint16_t port) noexcept {
+    static bool resolveIpAnyToIn6_(const char* host, sockaddr_in6& out, uint16_t port) noexcept {
         if (!host || !host[0]) return false;
 
-        in_addr addr{};
-        if (inet_pton(AF_INET, host, &addr) == 1) {
+        std::string h(host);
+        if (h.size() >= 2 && h.front() == '[' && h.back() == ']') {
+            h = h.substr(1, h.size() - 2);
+        }
+
+        // Numeric IPv6.
+        in6_addr addr6{};
+        if (inet_pton(AF_INET6, h.c_str(), &addr6) == 1) {
             out = {};
-            out.sin_family = AF_INET;
-            out.sin_addr = addr;
-            out.sin_port = htons(port);
+            out.sin6_family = AF_INET6;
+            out.sin6_addr = addr6;
+            out.sin6_port = htons(port);
+            return true;
+        }
+
+        // Numeric IPv4 -> v4-mapped IPv6.
+        in_addr addr4{};
+        if (inet_pton(AF_INET, h.c_str(), &addr4) == 1) {
+            out = {};
+            out.sin6_family = AF_INET6;
+            out.sin6_port = htons(port);
+            out.sin6_addr = {};
+            out.sin6_addr.s6_addr[10] = 0xff;
+            out.sin6_addr.s6_addr[11] = 0xff;
+            std::memcpy(&out.sin6_addr.s6_addr[12], &addr4, 4);
             return true;
         }
 
         addrinfo hints{};
-        hints.ai_family = AF_INET;
+        hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_DGRAM;
         addrinfo* res = nullptr;
-        if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) return false;
+        if (getaddrinfo(h.c_str(), nullptr, &hints, &res) != 0 || !res) return false;
 
         bool ok = false;
+        // Prefer IPv6 if available.
         for (addrinfo* ai = res; ai; ai = ai->ai_next) {
-            if (!ai->ai_addr || ai->ai_family != AF_INET) continue;
-            const auto* sin = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
-            out = *sin;
-            out.sin_port = htons(port);
-            ok = true;
-            break;
+            if (!ai->ai_addr) continue;
+            if (ai->ai_family == AF_INET6) {
+                const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(ai->ai_addr);
+                out = *sin6;
+                out.sin6_port = htons(port);
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            for (addrinfo* ai = res; ai; ai = ai->ai_next) {
+                if (!ai->ai_addr) continue;
+                if (ai->ai_family == AF_INET) {
+                    const auto* sin = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
+                    out = {};
+                    out.sin6_family = AF_INET6;
+                    out.sin6_port = htons(port);
+                    out.sin6_addr = {};
+                    out.sin6_addr.s6_addr[10] = 0xff;
+                    out.sin6_addr.s6_addr[11] = 0xff;
+                    std::memcpy(&out.sin6_addr.s6_addr[12], &sin->sin_addr, 4);
+                    ok = true;
+                    break;
+                }
+            }
         }
 
         freeaddrinfo(res);
         return ok;
+    }
+
+    static bool parseHostPort_(const char* s, std::string& outHost, uint16_t& outPort) noexcept {
+        outHost.clear();
+        outPort = 0;
+        if (!s || !s[0]) return false;
+        std::string t(s);
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\t' || t.back() == '\r' || t.back() == '\n')) t.pop_back();
+        size_t b = 0;
+        while (b < t.size() && (t[b] == ' ' || t[b] == '\t' || t[b] == '\r' || t[b] == '\n')) ++b;
+        t = t.substr(b);
+        if (t.empty()) return false;
+
+        std::string host;
+        uint16_t port = 0;
+        if (!t.empty() && t.front() == '[') {
+            const auto rb = t.find(']');
+            if (rb == std::string::npos) return false;
+            host = t.substr(1, rb - 1);
+            if (rb + 1 >= t.size() || t[rb + 1] != ':') return false;
+            try {
+                const int p = std::stoi(t.substr(rb + 2));
+                if (p >= 1 && p <= 65535) port = static_cast<uint16_t>(p);
+            } catch (...) {
+                port = 0;
+            }
+        } else {
+            const auto colon = t.rfind(':');
+            if (colon == std::string::npos || colon + 1 >= t.size()) return false;
+            host = t.substr(0, colon);
+            try {
+                const int p = std::stoi(t.substr(colon + 1));
+                if (p >= 1 && p <= 65535) port = static_cast<uint16_t>(p);
+            } catch (...) {
+                port = 0;
+            }
+        }
+
+        if (host.empty() || port == 0) return false;
+        outHost = host;
+        outPort = port;
+        return true;
     }
 
     static bool parseRoomServerUrl(const char* url, std::string& outHost, uint16_t& outPort) noexcept {
@@ -442,14 +525,28 @@ struct UdpNetplay {
 
         std::string host = s;
         uint16_t port = 0;
-        const auto colon = s.rfind(':');
-        if (colon != std::string::npos && colon + 1 < s.size()) {
-            host = s.substr(0, colon);
-            try {
-                const int p = std::stoi(s.substr(colon + 1));
-                if (p >= 1 && p <= 65535) port = static_cast<uint16_t>(p);
-            } catch (...) {
-                port = 0;
+        if (!s.empty() && s.front() == '[') {
+            const auto rb = s.find(']');
+            if (rb == std::string::npos) return false;
+            host = s.substr(1, rb - 1);
+            if (rb + 1 < s.size() && s[rb + 1] == ':' && rb + 2 < s.size()) {
+                try {
+                    const int p = std::stoi(s.substr(rb + 2));
+                    if (p >= 1 && p <= 65535) port = static_cast<uint16_t>(p);
+                } catch (...) {
+                    port = 0;
+                }
+            }
+        } else {
+            const auto colon = s.rfind(':');
+            if (colon != std::string::npos && colon + 1 < s.size()) {
+                host = s.substr(0, colon);
+                try {
+                    const int p = std::stoi(s.substr(colon + 1));
+                    if (p >= 1 && p <= 65535) port = static_cast<uint16_t>(p);
+                } catch (...) {
+                    port = 0;
+                }
             }
         }
         if (host.empty()) return false;
@@ -468,8 +565,8 @@ struct UdpNetplay {
         uint16_t port = 0;
         if (!parseRoomServerUrl(roomServerUrl, host, port)) return false;
 
-        sockaddr_in server{};
-        if (!resolveIpv4(host.c_str(), server, port)) return false;
+        sockaddr_in6 server{};
+        if (!resolveIpAnyToIn6_(host.c_str(), server, port)) return false;
 
         std::string code;
         code.reserve(16);
@@ -496,26 +593,25 @@ struct UdpNetplay {
 
             for (int i = 0; i < 8; ++i) {
                 char buf[256] = {};
-                sockaddr_in from{};
+                sockaddr_in6 from{};
                 socklen_t fromLen = sizeof(from);
                 const int n = static_cast<int>(recvfrom(sock, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &fromLen));
                 if (n <= 0) break;
-                if (from.sin_addr.s_addr != server.sin_addr.s_addr) continue;
+                if (from.sin6_port != server.sin6_port || from.sin6_scope_id != server.sin6_scope_id || std::memcmp(&from.sin6_addr, &server.sin6_addr, sizeof(in6_addr)) != 0) continue;
                 if (n < 10) continue;
                 if (std::memcmp(buf, "SNO_PEER1", 9) != 0) continue;
 
-                char ip[64] = {};
-                int p = 0;
-                if (std::sscanf(buf + 9, "%63[^:]:%d", ip, &p) == 2) {
-                    if (p >= 1 && p <= 65535) {
-                        sockaddr_in dst{};
-                        if (resolveIpv4(ip, dst, static_cast<uint16_t>(p))) {
-                            remote = dst;
-                            remotePort = static_cast<uint16_t>(p);
-                            return true;
-                        }
-                    }
-                }
+                buf[(n >= static_cast<int>(sizeof(buf))) ? (static_cast<int>(sizeof(buf)) - 1) : n] = 0;
+                const char* payload = buf + 9;
+                while (*payload == ' ' || *payload == '\t') ++payload;
+                std::string peerHost;
+                uint16_t peerPort = 0;
+                if (!parseHostPort_(payload, peerHost, peerPort)) continue;
+                sockaddr_in6 dst{};
+                if (!resolveIpAnyToIn6_(peerHost.c_str(), dst, peerPort)) continue;
+                remote = dst;
+                remotePort = peerPort;
+                return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -552,17 +648,20 @@ struct UdpNetplay {
 
         discoverPeer = false;
 
-        sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+        sock = ::socket(AF_INET6, SOCK_DGRAM, 0);
         if (sock < 0) return false;
+
+        int v6only = 0;
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
 
         int buf = 1 << 20;
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
         setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
 
-        sockaddr_in local{};
-        local.sin_family = AF_INET;
-        local.sin_addr.s_addr = htonl(INADDR_ANY);
-        local.sin_port = htons(localPort);
+        sockaddr_in6 local{};
+        local.sin6_family = AF_INET6;
+        local.sin6_addr = in6addr_any;
+        local.sin6_port = htons(localPort);
         if (bind(sock, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0) {
             stop();
             return false;
@@ -571,16 +670,16 @@ struct UdpNetplay {
         setNonBlocking(sock);
 
         if (remoteHost && remoteHost[0]) {
-            if (!resolveIpv4(remoteHost, remote, remotePort)) {
+            if (!resolveIpAnyToIn6_(remoteHost, remote, remotePort)) {
                 stop();
                 return false;
             }
         } else {
             discoverPeer = (localPlayerNum == 1);
             remote = {};
-            remote.sin_family = AF_INET;
-            remote.sin_port = htons(remotePort);
-            remote.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            remote.sin6_family = AF_INET6;
+            remote.sin6_port = htons(remotePort);
+            remote.sin6_addr = in6addr_loopback;
         }
 
         // Joiner: if no direct host endpoint is known, use the room-server rendezvous.
@@ -609,13 +708,21 @@ struct UdpNetplay {
         return selfStateReady && peerStateReady && selfSaveRamReady && peerSaveRamReady;
     }
 
-    void markPeerConnected_(const sockaddr_in& from) noexcept {
+    void markPeerConnected_(const sockaddr_in6& from) noexcept {
         if (!hasPeer) {
             hasPeer = true;
             lastRecv = std::chrono::steady_clock::now();
             if (discoverPeer) {
                 remote = from;
-                remotePort = ntohs(from.sin_port);
+                remotePort = ntohs(from.sin6_port);
+            }
+        }
+
+        // Keep peer IP pinned but allow port to float (NATs may rewrite source ports).
+        if (hasPeer && remote.sin6_family == AF_INET6 && from.sin6_family == AF_INET6) {
+            if (remote.sin6_scope_id == from.sin6_scope_id && std::memcmp(&remote.sin6_addr, &from.sin6_addr, sizeof(in6_addr)) == 0) {
+                remote.sin6_port = from.sin6_port;
+                remotePort = ntohs(from.sin6_port);
             }
         }
         lastRecv = std::chrono::steady_clock::now();
@@ -751,7 +858,7 @@ struct UdpNetplay {
 
         for (;;) {
             uint8_t buf[1500] = {};
-            sockaddr_in from{};
+            sockaddr_in6 from{};
             socklen_t fromLen = sizeof(from);
             const ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
             if (n < 0) break;
@@ -759,6 +866,11 @@ struct UdpNetplay {
 
             const uint32_t magic = read_u32_be_(buf);
             markPeerConnected_(from);
+
+            if (magic == kMagicKeepAlive) {
+                // Keepalive: refresh peer/lastRecv only.
+                continue;
+            }
 
             if (magic == kMagicInput) {
                 if (static_cast<size_t>(n) < sizeof(Packet)) continue;
@@ -930,9 +1042,27 @@ struct UdpNetplay {
             }
         }
 
-        if (hasPeer && (std::chrono::steady_clock::now() - lastRecv) > std::chrono::seconds(5)) {
+        // Mobile networks can have multi-second stalls; don't drop too aggressively.
+        if (hasPeer && (std::chrono::steady_clock::now() - lastRecv) > std::chrono::seconds(20)) {
             hasPeer = false;
         }
+    }
+
+    void sendKeepAlive() noexcept {
+        if (sock < 0) return;
+        if (!hasPeer) return;
+        if (remote.sin_family != AF_INET || remote.sin_port == 0) return;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (lastKeepAliveSent.time_since_epoch().count() != 0 && (now - lastKeepAliveSent) < std::chrono::milliseconds(250)) {
+            return;
+        }
+        lastKeepAliveSent = now;
+
+        uint8_t pkt[8] = {};
+        write_u32_be_(pkt, kMagicKeepAlive);
+        write_u32_be_(pkt + 4, 0);
+        sendto(sock, pkt, sizeof(pkt), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
     }
 
     void sendLocal(uint16_t localMask) noexcept {
@@ -1091,7 +1221,9 @@ void loop60fps() {
 
             if (g_netplayEnabled.load(std::memory_order_relaxed) && g_netplay) {
                 g_netplay->pumpRecv();
-                if (!paused) {
+                if (paused) {
+                    g_netplay->sendKeepAlive();
+                } else {
                     g_netplay->sendLocal(localMask);
                 }
 
@@ -1355,7 +1487,7 @@ int snesonline_ios_stun_public_udp_port(int localPort) {
     const uint16_t lp = static_cast<uint16_t>((localPort >= 1 && localPort <= 65535) ? localPort : 0);
     if (lp == 0) return 0;
     snesonline::StunMappedAddress out;
-    if (!snesonline::stunDiscoverMappedAddressDefault(lp, out)) return 0;
+    if (!snesonline::stunDiscoverMappedAddressDefault(lp, out, 2000)) return 0;
     return static_cast<int>(out.port);
 }
 
@@ -1365,9 +1497,13 @@ const char* snesonline_ios_stun_mapped_address(int localPort) {
     const uint16_t lp = static_cast<uint16_t>((localPort >= 1 && localPort <= 65535) ? localPort : 0);
     if (lp == 0) return "";
     snesonline::StunMappedAddress out;
-    if (!snesonline::stunDiscoverMappedAddressDefault(lp, out)) return "";
+    if (!snesonline::stunDiscoverMappedAddressDefault(lp, out, 2000)) return "";
     if (out.ip.empty() || out.port == 0) return "";
-    s = out.ip + ":" + std::to_string(out.port);
+    if (out.ip.find(':') != std::string::npos) {
+        s = "[" + out.ip + "]:" + std::to_string(out.port);
+    } else {
+        s = out.ip + ":" + std::to_string(out.port);
+    }
     return s.c_str();
 }
 

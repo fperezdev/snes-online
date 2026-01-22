@@ -65,37 +65,76 @@ static void randomBytes(uint8_t* dst, size_t n) {
     for (size_t i = 0; i < n; ++i) dst[i] = static_cast<uint8_t>(rd());
 }
 
-static bool resolveIpv4Udp(const char* host, uint16_t port, sockaddr_in& out) {
+static bool resolveUdp(const char* host, uint16_t port, sockaddr_storage& out, socklen_t& outLen) {
     if (!host || !host[0]) return false;
 
     // Numeric fast-path.
-    in_addr a{};
-    if (inet_pton(AF_INET, host, &a) == 1) {
-        out = {};
-        out.sin_family = AF_INET;
-        out.sin_addr = a;
-        out.sin_port = htons(port);
-        return true;
+    {
+        in_addr a4{};
+        if (inet_pton(AF_INET, host, &a4) == 1) {
+            sockaddr_in sin{};
+            sin.sin_family = AF_INET;
+            sin.sin_addr = a4;
+            sin.sin_port = htons(port);
+            std::memset(&out, 0, sizeof(out));
+            std::memcpy(&out, &sin, sizeof(sin));
+            outLen = static_cast<socklen_t>(sizeof(sin));
+            return true;
+        }
+    }
+    {
+        in6_addr a6{};
+        if (inet_pton(AF_INET6, host, &a6) == 1) {
+            sockaddr_in6 sin6{};
+            sin6.sin6_family = AF_INET6;
+            sin6.sin6_addr = a6;
+            sin6.sin6_port = htons(port);
+            std::memset(&out, 0, sizeof(out));
+            std::memcpy(&out, &sin6, sizeof(sin6));
+            outLen = static_cast<socklen_t>(sizeof(sin6));
+            return true;
+        }
     }
 
     addrinfo hints{};
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
 
     addrinfo* res = nullptr;
     if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) return false;
 
-    bool ok = false;
+    const addrinfo* best4 = nullptr;
+    const addrinfo* best6 = nullptr;
     for (addrinfo* ai = res; ai; ai = ai->ai_next) {
-        if (!ai->ai_addr || ai->ai_family != AF_INET) continue;
-        out = *reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
-        out.sin_port = htons(port);
-        ok = true;
-        break;
+        if (!ai->ai_addr) continue;
+        if (ai->ai_family == AF_INET && !best4) best4 = ai;
+        else if (ai->ai_family == AF_INET6 && !best6) best6 = ai;
+    }
+
+    const addrinfo* pick = best4 ? best4 : best6;
+    if (!pick) {
+        freeaddrinfo(res);
+        return false;
+    }
+
+    std::memset(&out, 0, sizeof(out));
+    std::memcpy(&out, pick->ai_addr, static_cast<size_t>(pick->ai_addrlen));
+    outLen = static_cast<socklen_t>(pick->ai_addrlen);
+
+    if (pick->ai_family == AF_INET) {
+        auto* sin = reinterpret_cast<sockaddr_in*>(&out);
+        sin->sin_port = htons(port);
+    } else if (pick->ai_family == AF_INET6) {
+        auto* sin6 = reinterpret_cast<sockaddr_in6*>(&out);
+        sin6->sin6_port = htons(port);
+    } else {
+        freeaddrinfo(res);
+        return false;
     }
 
     freeaddrinfo(res);
-    return ok;
+    return true;
 }
 
 static bool parseMappedAddressAttr(uint16_t attrType, const uint8_t* v, uint16_t len, const uint8_t txid[12], StunMappedAddress& out) {
@@ -106,25 +145,49 @@ static bool parseMappedAddressAttr(uint16_t attrType, const uint8_t* v, uint16_t
     //  4..: address
     if (!v || len < 8) return false;
     const uint8_t family = v[1];
-    if (family != 0x01) return false; // IPv4 only
 
     uint16_t port = readBE16(v + 2);
-    uint32_t addr = readBE32(v + 4);
-
     if (attrType == kAttrXorMappedAddress) {
         port = static_cast<uint16_t>(port ^ static_cast<uint16_t>((kStunMagicCookie >> 16u) & 0xFFFFu));
-        addr = addr ^ kStunMagicCookie;
-        (void)txid;
     }
 
-    in_addr a{};
-    a.s_addr = htonl(addr);
-    char ipBuf[64] = {};
-    if (!inet_ntop(AF_INET, &a, ipBuf, sizeof(ipBuf))) return false;
+    if (family == 0x01) {
+        if (len < 8) return false;
+        uint32_t addr = readBE32(v + 4);
+        if (attrType == kAttrXorMappedAddress) {
+            addr = addr ^ kStunMagicCookie;
+        }
 
-    out.ip = std::string(ipBuf);
-    out.port = port;
-    return out.port >= 1 && out.port <= 65535;
+        in_addr a{};
+        a.s_addr = htonl(addr);
+        char ipBuf[64] = {};
+        if (!inet_ntop(AF_INET, &a, ipBuf, sizeof(ipBuf))) return false;
+        out.ip = std::string(ipBuf);
+        out.port = port;
+        return out.port >= 1 && out.port <= 65535;
+    }
+
+    if (family == 0x02) {
+        if (len < 20) return false;
+        uint8_t addr[16] = {};
+        std::memcpy(addr, v + 4, 16);
+        if (attrType == kAttrXorMappedAddress) {
+            uint8_t key[16] = {};
+            writeBE32(key, kStunMagicCookie);
+            std::memcpy(key + 4, txid, 12);
+            for (int i = 0; i < 16; ++i) addr[i] = static_cast<uint8_t>(addr[i] ^ key[i]);
+        }
+
+        in6_addr a6{};
+        std::memcpy(&a6, addr, 16);
+        char ipBuf[128] = {};
+        if (!inet_ntop(AF_INET6, &a6, ipBuf, sizeof(ipBuf))) return false;
+        out.ip = std::string(ipBuf);
+        out.port = port;
+        return out.port >= 1 && out.port <= 65535;
+    }
+
+    return false;
 }
 
 #if defined(_WIN32)
@@ -153,32 +216,50 @@ bool stunDiscoverMappedAddress(const char* stunHost, uint16_t stunPort, uint16_t
     if (!wsa.ok) return false;
 #endif
 
-    sockaddr_in dst{};
-    if (!resolveIpv4Udp(stunHost, stunPort, dst)) return false;
+    sockaddr_storage dst{};
+    socklen_t dstLen = 0;
+    if (!resolveUdp(stunHost, stunPort, dst, dstLen)) return false;
 
-    const int s = static_cast<int>(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    const int family = reinterpret_cast<const sockaddr*>(&dst)->sa_family;
+    const int s = static_cast<int>(::socket(family, SOCK_DGRAM, IPPROTO_UDP));
     if (s < 0) return false;
 
-    sockaddr_in bindAddr{};
-    bindAddr.sin_family = AF_INET;
-    bindAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bindAddr.sin_port = htons(localBindPort);
-    if (::bind(s, reinterpret_cast<const sockaddr*>(&bindAddr), sizeof(bindAddr)) != 0) {
+    if (family == AF_INET6) {
+        // Best-effort: allow dual-stack if the platform supports it.
+        int v6only = 0;
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&v6only), sizeof(v6only));
+    }
+
+    if (family == AF_INET) {
+        sockaddr_in bindAddr{};
+        bindAddr.sin_family = AF_INET;
+        bindAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+        bindAddr.sin_port = htons(localBindPort);
+        if (::bind(s, reinterpret_cast<const sockaddr*>(&bindAddr), sizeof(bindAddr)) != 0) {
+            closesock(s);
+            return false;
+        }
+    } else if (family == AF_INET6) {
+        sockaddr_in6 bindAddr6{};
+        bindAddr6.sin6_family = AF_INET6;
+        bindAddr6.sin6_addr = in6addr_any;
+        bindAddr6.sin6_port = htons(localBindPort);
+        if (::bind(s, reinterpret_cast<const sockaddr*>(&bindAddr6), sizeof(bindAddr6)) != 0) {
+            closesock(s);
+            return false;
+        }
+    } else {
         closesock(s);
         return false;
     }
 
-#if defined(_WIN32)
-    DWORD tv = static_cast<DWORD>(timeoutMs);
-    setsockopt(static_cast<SOCKET>(s), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-#else
-    timeval tv{};
-    tv.tv_sec = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
+    // Retry a few times to reduce flakiness on lossy networks.
+    // Keep the overall time bounded by splitting timeoutMs across attempts.
+    if (timeoutMs < 200) timeoutMs = 200;
+    static constexpr int kAttempts = 3;
+    const int perAttemptMs = (timeoutMs + (kAttempts - 1)) / kAttempts;
 
-    // Build binding request.
+    // Build binding request once (fixed txid) so we only accept matching responses.
     std::array<uint8_t, sizeof(StunHeader)> req{};
     StunHeader hdr{};
     hdr.type_be = htons(kStunBindingRequest);
@@ -187,87 +268,108 @@ bool stunDiscoverMappedAddress(const char* stunHost, uint16_t stunPort, uint16_t
     randomBytes(hdr.txid, sizeof(hdr.txid));
     std::memcpy(req.data(), &hdr, sizeof(hdr));
 
-    const auto sent = ::sendto(s, reinterpret_cast<const char*>(req.data()), static_cast<int>(req.size()), 0,
-                               reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
-    if (sent < 0 || static_cast<size_t>(sent) != req.size()) {
-        closesock(s);
-        return false;
-    }
-
     std::array<uint8_t, 1500> resp{};
-    sockaddr_in from{};
+
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
 #if defined(_WIN32)
-    int fromLen = sizeof(from);
-    const auto n = ::recvfrom(s, reinterpret_cast<char*>(resp.data()), static_cast<int>(resp.size()), 0,
-                              reinterpret_cast<sockaddr*>(&from), &fromLen);
+        DWORD tv = static_cast<DWORD>(perAttemptMs);
+        setsockopt(static_cast<SOCKET>(s), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 #else
-    socklen_t fromLen = sizeof(from);
-    const auto n = ::recvfrom(s, resp.data(), resp.size(), 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
+        timeval tv{};
+        tv.tv_sec = perAttemptMs / 1000;
+        tv.tv_usec = (perAttemptMs % 1000) * 1000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 
-    closesock(s);
-
-    if (n < static_cast<decltype(n)>(sizeof(StunHeader))) return false;
-
-    StunHeader rh{};
-    std::memcpy(&rh, resp.data(), sizeof(StunHeader));
-
-    const uint16_t type = ntohs(rh.type_be);
-    const uint16_t len = ntohs(rh.length_be);
-    const uint32_t cookie = ntohl(rh.cookie_be);
-
-    if (type != kStunBindingSuccess) return false;
-    if (cookie != kStunMagicCookie) return false;
-    if (std::memcmp(rh.txid, hdr.txid, sizeof(hdr.txid)) != 0) return false;
-
-    const auto total = static_cast<decltype(n)>(sizeof(StunHeader)) + static_cast<decltype(n)>(len);
-    if (total > n) return false;
-
-    // Parse attributes.
-    const uint8_t* p = resp.data() + sizeof(StunHeader);
-    size_t remain = len;
-
-    bool got = false;
-    StunMappedAddress best{};
-
-    while (remain >= 4) {
-        const uint16_t at = readBE16(p);
-        const uint16_t alen = readBE16(p + 2);
-        p += 4;
-        remain -= 4;
-        if (alen > remain) break;
-
-        if (at == kAttrXorMappedAddress) {
-            StunMappedAddress tmp{};
-            if (parseMappedAddressAttr(at, p, alen, rh.txid, tmp)) {
-                best = tmp;
-                got = true;
-                // Prefer XOR-MAPPED; we can stop.
-                break;
-            }
-        } else if (at == kAttrMappedAddress && !got) {
-            StunMappedAddress tmp{};
-            if (parseMappedAddressAttr(at, p, alen, rh.txid, tmp)) {
-                best = tmp;
-                got = true;
-            }
+        const auto sent = ::sendto(s, reinterpret_cast<const char*>(req.data()), static_cast<int>(req.size()), 0,
+                       reinterpret_cast<const sockaddr*>(&dst), dstLen);
+        if (sent < 0 || static_cast<size_t>(sent) != req.size()) {
+            // If sending fails, retries are unlikely to help.
+            closesock(s);
+            return false;
         }
 
-        const size_t padded = (static_cast<size_t>(alen) + 3u) & ~3u;
-        if (padded > remain) break;
-        p += padded;
-        remain -= padded;
+        sockaddr_storage from{};
+#if defined(_WIN32)
+        int fromLen = static_cast<int>(sizeof(from));
+        const auto n = ::recvfrom(s, reinterpret_cast<char*>(resp.data()), static_cast<int>(resp.size()), 0,
+                                  reinterpret_cast<sockaddr*>(&from), &fromLen);
+#else
+        socklen_t fromLen = sizeof(from);
+        const auto n = ::recvfrom(s, resp.data(), resp.size(), 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
+#endif
+
+        if (n < static_cast<decltype(n)>(sizeof(StunHeader))) {
+            continue; // timeout or short packet
+        }
+
+        StunHeader rh{};
+        std::memcpy(&rh, resp.data(), sizeof(StunHeader));
+
+        const uint16_t type = ntohs(rh.type_be);
+        const uint16_t len = ntohs(rh.length_be);
+        const uint32_t cookie = ntohl(rh.cookie_be);
+
+        if (type != kStunBindingSuccess) continue;
+        if (cookie != kStunMagicCookie) continue;
+        if (std::memcmp(rh.txid, hdr.txid, sizeof(hdr.txid)) != 0) continue;
+
+        const auto total = static_cast<decltype(n)>(sizeof(StunHeader)) + static_cast<decltype(n)>(len);
+        if (total > n) continue;
+
+        // Parse attributes.
+        const uint8_t* p = resp.data() + sizeof(StunHeader);
+        size_t remain = len;
+
+        bool got = false;
+        StunMappedAddress best{};
+
+        while (remain >= 4) {
+            const uint16_t at = readBE16(p);
+            const uint16_t alen = readBE16(p + 2);
+            p += 4;
+            remain -= 4;
+            if (alen > remain) break;
+
+            if (at == kAttrXorMappedAddress) {
+                StunMappedAddress tmp{};
+                if (parseMappedAddressAttr(at, p, alen, rh.txid, tmp)) {
+                    best = tmp;
+                    got = true;
+                    // Prefer XOR-MAPPED; we can stop.
+                    break;
+                }
+            } else if (at == kAttrMappedAddress && !got) {
+                StunMappedAddress tmp{};
+                if (parseMappedAddressAttr(at, p, alen, rh.txid, tmp)) {
+                    best = tmp;
+                    got = true;
+                }
+            }
+
+            const size_t padded = (static_cast<size_t>(alen) + 3u) & ~3u;
+            if (padded > remain) break;
+            p += padded;
+            remain -= padded;
+        }
+
+        if (got) {
+            out = best;
+            closesock(s);
+            return true;
+        }
     }
 
-    if (!got) return false;
-    out = best;
-    return true;
+    closesock(s);
+    return false;
 }
 
 bool stunDiscoverMappedAddressDefault(uint16_t localBindPort, StunMappedAddress& out, int timeoutPerServerMs) {
-    static constexpr std::array<std::pair<const char*, uint16_t>, 3> kServers = {
+    static constexpr std::array<std::pair<const char*, uint16_t>, 5> kServers = {
         std::pair<const char*, uint16_t>{"stun.cloudflare.com", 3478},
         std::pair<const char*, uint16_t>{"stun.l.google.com", 19302},
+        std::pair<const char*, uint16_t>{"stun1.l.google.com", 19302},
+        std::pair<const char*, uint16_t>{"stun2.l.google.com", 19302},
         std::pair<const char*, uint16_t>{"global.stun.twilio.com", 3478},
     };
 

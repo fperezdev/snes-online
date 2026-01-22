@@ -700,11 +700,41 @@ private enum ConnectionCode {
             let kv = part.split(separator: "=", maxSplits: 1)
             if kv.count == 2 && kv[0] == "pub" { pub = String(kv[1]) }
         }
-        let hp = pub.split(separator: ":")
-        guard hp.count == 2, let port = Int(hp[1]), port >= 1, port <= 65535 else {
+        let trimmed = pub.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
             throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Missing valid public endpoint"])
         }
-        return Endpoint(host: String(hp[0]), port: port)
+
+        // Supports:
+        // - ipv4:port
+        // - hostname:port
+        // - [ipv6]:port
+        // - (best-effort) raw ipv6 with port appended (split on last ':')
+        if trimmed.hasPrefix("[") {
+            guard let r = trimmed.firstIndex(of: "]") else {
+                throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid public endpoint"])
+            }
+            let host = String(trimmed[trimmed.index(after: trimmed.startIndex)..<r])
+            let after = trimmed[trimmed.index(after: r)...]
+            guard after.hasPrefix(":") else {
+                throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid public endpoint"])
+            }
+            let portStr = String(after.dropFirst())
+            guard let port = Int(portStr), port >= 1, port <= 65535 else {
+                throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Missing valid public endpoint"])
+            }
+            return Endpoint(host: host, port: port)
+        }
+
+        guard let lastColon = trimmed.lastIndex(of: ":") else {
+            throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Missing valid public endpoint"])
+        }
+        let host = String(trimmed[..<lastColon])
+        let portStr = String(trimmed[trimmed.index(after: lastColon)...])
+        guard !host.isEmpty, let port = Int(portStr), port >= 1, port <= 65535 else {
+            throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Missing valid public endpoint"])
+        }
+        return Endpoint(host: host, port: port)
     }
 
     private static func shortSigB64Url(_ payload: String) -> String {
