@@ -50,7 +50,9 @@ final class IOSGameViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .black
 
-        if config.showSaveButton {
+        // Android has no action bar; prefer fullscreen UX.
+        // Provide a fallback nav-bar State button only when touch controls are hidden.
+        if config.showSaveButton && !config.showOnscreenControls {
             navigationItem.rightBarButtonItem = UIBarButtonItem(title: "State",
                                                                 style: .plain,
                                                                 target: self,
@@ -88,6 +90,10 @@ final class IOSGameViewController: UIViewController {
             ov.onMaskChanged = { [weak self] mask in
                 self?.overlayMask = mask
                 self?.pushInput()
+            }
+            ov.showStateButton = config.showSaveButton
+            ov.onStateRequested = { [weak self] in
+                self?.showStateMenu()
             }
             view.addSubview(ov)
             NSLayoutConstraint.activate([
@@ -321,6 +327,7 @@ final class IOSGameViewController: UIViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        navigationController?.setNavigationBarHidden(false, animated: animated)
         displayLink?.invalidate()
         displayLink = nil
 
@@ -331,31 +338,60 @@ final class IOSGameViewController: UIViewController {
         audioEngine = nil
     }
 
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        navigationController?.setNavigationBarHidden(true, animated: animated)
+    }
+
     @objc private func showStateMenu() {
+        // Netplay rule: only host can create/load the canonical savestate.
+        if config.enableNetplay && config.localPlayerNum != 1 {
+            showToast("Only the host can save/load.")
+            return
+        }
+
         NativeBridgeIOS.setPaused(true)
 
-        let alert = UIAlertController(title: "State", message: nil, preferredStyle: .actionSheet)
-        alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
-            guard let self else { return }
-            let ok = NativeBridgeIOS.saveState(toPath: self.config.stateURL.path)
-            self.NativeBridgeIOS_setPausedFalseLater()
-            self.showToast(ok ? "Saved" : "Save failed")
-        })
-        alert.addAction(UIAlertAction(title: "Load", style: .default) { [weak self] _ in
-            guard let self else { return }
-            let ok = NativeBridgeIOS.loadState(fromPath: self.config.stateURL.path)
-            self.NativeBridgeIOS_setPausedFalseLater()
-            self.showToast(ok ? "Loaded" : "Load failed")
-        })
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { [weak self] _ in
-            self?.NativeBridgeIOS_setPausedFalseLater()
-        })
-
-        // iPad: anchor to bar button.
-        if let pop = alert.popoverPresentationController {
-            pop.barButtonItem = navigationItem.rightBarButtonItem
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let statesDir = docs.appendingPathComponent("states", isDirectory: true)
+        try? FileManager.default.createDirectory(at: statesDir, withIntermediateDirectories: true)
+        let base = config.romURL.deletingPathExtension().lastPathComponent.isEmpty ? "game" : config.romURL.deletingPathExtension().lastPathComponent
+        let slots: [StateSlotsViewController.Slot] = (1...5).map { i in
+            let url = statesDir.appendingPathComponent("\(base)_slot\(i).state")
+            return StateSlotsViewController.Slot(index1: i, url: url)
         }
-        present(alert, animated: true)
+
+        let vc = StateSlotsViewController()
+        vc.modalPresentationStyle = .overFullScreen
+        vc.slots = slots
+        vc.isNetplayEnabled = config.enableNetplay
+        vc.onToast = { [weak self] msg in self?.showToast(msg) }
+        vc.onClose = { [weak self] in
+            self?.NativeBridgeIOS_setPausedFalseLater()
+        }
+        vc.onNetplayWaitForReadyThenUnpause = { [weak self] in
+            self?.waitForNetplayReadyThenUnpause()
+        }
+        present(vc, animated: true)
+    }
+
+    private func waitForNetplayReadyThenUnpause() {
+        func tick(_ remainingMs: Int) {
+            if remainingMs <= 0 {
+                NativeBridgeIOS.setPaused(false)
+                return
+            }
+            let st = NativeBridgeIOS.netplayStatus()
+            if st == 3 {
+                NativeBridgeIOS.setPaused(false)
+                showToast("State synced")
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
+                tick(remainingMs - 100)
+            }
+        }
+        tick(10_000)
     }
 
     private func NativeBridgeIOS_setPausedFalseLater() {

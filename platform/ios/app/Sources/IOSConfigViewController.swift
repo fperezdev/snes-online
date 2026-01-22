@@ -2,7 +2,7 @@ import UIKit
 import UniformTypeIdentifiers
 import CryptoKit
 
-final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate {
+final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate, UITextFieldDelegate {
     private enum Keys {
         static let romBookmark = "romBookmark"
         static let enableNetplay = "enableNetplay"
@@ -15,6 +15,14 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
         static let connectionCode = "connectionCode"
     }
 
+    // Mirrors Android's ConnectionUiState.
+    private enum ConnectionUiState {
+        case idle
+        case hostReady
+        case joinInput
+        case joinReady
+    }
+
     // Default core location inside the app bundle.
     // In CI/AltStore packaging we move the dylib to Frameworks/ for better signing compatibility.
     private let defaultBundledCoreRelPath = "Frameworks/snes9x_libretro_ios.dylib"
@@ -22,32 +30,45 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
     private let scroll = UIScrollView()
     private let stack = UIStackView()
 
-    private let romLabel = UILabel()
+    private let headerLabel = UILabel()
+
+    private let romTitleLabel = UILabel()
+    private let romPathField = UITextField()
     private let pickRomButton = UIButton(type: .system)
 
     private let showTouchSwitch = UISwitch()
     private let showSaveSwitch = UISwitch()
 
+    private let audioTitleLabel = UILabel()
+
+    private let netplayTitleLabel = UILabel()
     private let netplaySwitch = UISwitch()
-    private let remoteHostField = UITextField()
-    private let remotePortField = UITextField()
     private let localPortField = UITextField()
-    private let localPlayerField = UITextField()
 
+    private let startConnectionButton = UIButton(type: .system)
+    private let orLabel = UILabel()
     private let connectionCodeField = UITextView()
-    private let generateCodeButton = UIButton(type: .system)
-    private let applyCodeButton = UIButton(type: .system)
-    private let copyCodeButton = UIButton(type: .system)
+    private let joinConnectionButton = UIButton(type: .system)
 
-    private let statusLabel = UILabel()
+    private let hostWaitingRow = UIStackView()
+    private let hostWaitingLabel = UILabel()
+    private let copyConnectionIconButton = UIButton(type: .system)
+
+    private let joinTargetLabel = UILabel()
+    private let cancelConnectionButton = UIButton(type: .system)
+
     private let startButton = UIButton(type: .system)
+    private let statusLabel = UILabel()
 
     private var romURL: URL?
 
+    private var connectionUiState: ConnectionUiState = .idle
+    private var lastHostPublicEndpoint: String = "" // ip:port
+
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "SnesOnline"
-        view.backgroundColor = .systemBackground
+        title = "SNES ONLINE"
+        view.backgroundColor = UiStyle.configBackground
 
         stack.axis = .vertical
         stack.spacing = 12
@@ -72,85 +93,131 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
             stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -32)
         ])
 
-        romLabel.numberOfLines = 0
-        romLabel.text = "ROM: (none)"
+        // Header (Android has no action bar; this is our in-content title).
+        headerLabel.text = "SNES ONLINE"
+        headerLabel.font = UIFont.systemFont(ofSize: 22, weight: .bold)
+        headerLabel.textColor = UiStyle.configText
+        headerLabel.textAlignment = .left
+        stack.addArrangedSubview(headerLabel)
+
+        // ROM (.sfc/.smc)
+        romTitleLabel.text = "ROM (.sfc/.smc)"
+        romTitleLabel.font = UIFont.systemFont(ofSize: 16, weight: .regular)
+        romTitleLabel.textColor = UiStyle.configText
+        stack.addArrangedSubview(romTitleLabel)
+
+        romPathField.borderStyle = .roundedRect
+        romPathField.placeholder = "Pick a ROM file"
+        romPathField.delegate = self
+        romPathField.textColor = UiStyle.configText
+        stack.addArrangedSubview(romPathField)
 
         pickRomButton.setTitle("Pick ROM", for: .normal)
         pickRomButton.addTarget(self, action: #selector(pickRom), for: .touchUpInside)
-
-        stack.addArrangedSubview(makeSectionTitle("Controls"))
-        stack.addArrangedSubview(makeRow(label: "Show on-screen controls", control: showTouchSwitch))
-        stack.addArrangedSubview(makeRow(label: "Show in-game State button", control: showSaveSwitch))
-
-        stack.addArrangedSubview(makeSectionTitle("ROM"))
-        stack.addArrangedSubview(romLabel)
         stack.addArrangedSubview(pickRomButton)
 
-        stack.addArrangedSubview(makeSectionTitle("Netplay"))
-        stack.addArrangedSubview(makeRow(label: "Enable netplay", control: netplaySwitch))
+        // Switches (touch / state)
+        stack.addArrangedSubview(makeRow(label: "Show on-screen controls (touch)", control: showTouchSwitch))
+        stack.addArrangedSubview(makeRow(label: "Show in-game State button", control: showSaveSwitch))
 
-        remoteHostField.placeholder = "Remote host (blank=auto if Player 1 host)"
-        remoteHostField.borderStyle = .roundedRect
-        remotePortField.placeholder = "Remote UDP port (7000)"
-        remotePortField.borderStyle = .roundedRect
-        remotePortField.keyboardType = .numberPad
-        localPortField.placeholder = "Local UDP port (7000)"
+        // Audio (header only, like Android)
+        audioTitleLabel.text = "Audio"
+        audioTitleLabel.font = UIFont.systemFont(ofSize: 16, weight: .regular)
+        audioTitleLabel.textColor = UiStyle.configText
+        audioTitleLabel.layoutMargins = UIEdgeInsets(top: 12, left: 0, bottom: 0, right: 0)
+        stack.addArrangedSubview(audioTitleLabel)
+
+        // Netplay
+        netplayTitleLabel.text = "Netplay"
+        netplayTitleLabel.font = UIFont.systemFont(ofSize: 16, weight: .regular)
+        netplayTitleLabel.textColor = UiStyle.configText
+        stack.addArrangedSubview(netplayTitleLabel)
+
+        stack.addArrangedSubview(makeRow(label: "Enable Netplay", control: netplaySwitch))
+
         localPortField.borderStyle = .roundedRect
+        localPortField.placeholder = "Local UDP port (default 7000)"
         localPortField.keyboardType = .numberPad
-        localPlayerField.placeholder = "Local player num (1 or 2)"
-        localPlayerField.borderStyle = .roundedRect
-        localPlayerField.keyboardType = .numberPad
-
-        stack.addArrangedSubview(remoteHostField)
-        stack.addArrangedSubview(remotePortField)
+        localPortField.textColor = UiStyle.configText
         stack.addArrangedSubview(localPortField)
-        stack.addArrangedSubview(localPlayerField)
 
-        stack.addArrangedSubview(makeSectionTitle("Connection Code (STUN)"))
+        startConnectionButton.setTitle("Start connection", for: .normal)
+        startConnectionButton.addTarget(self, action: #selector(startConnectionTapped), for: .touchUpInside)
+        stack.addArrangedSubview(startConnectionButton)
 
-        generateCodeButton.setTitle("Generate Host Code", for: .normal)
-        generateCodeButton.addTarget(self, action: #selector(generateHostCode), for: .touchUpInside)
-        stack.addArrangedSubview(generateCodeButton)
+        orLabel.text = "OR"
+        orLabel.textAlignment = .center
+        orLabel.textColor = UiStyle.configText
+        stack.addArrangedSubview(orLabel)
 
-        connectionCodeField.layer.borderColor = UIColor.secondaryLabel.cgColor
+        connectionCodeField.layer.borderColor = UiStyle.dividerColor.cgColor
         connectionCodeField.layer.borderWidth = 1
         connectionCodeField.layer.cornerRadius = 8
         connectionCodeField.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        connectionCodeField.textColor = UiStyle.configText
+        connectionCodeField.backgroundColor = .white
         connectionCodeField.text = ""
         connectionCodeField.heightAnchor.constraint(equalToConstant: 90).isActive = true
         stack.addArrangedSubview(connectionCodeField)
 
-        let codeButtons = UIStackView()
-        codeButtons.axis = .horizontal
-        codeButtons.spacing = 12
-        codeButtons.distribution = .fillEqually
-        copyCodeButton.setTitle("Copy", for: .normal)
-        copyCodeButton.addTarget(self, action: #selector(copyCode), for: .touchUpInside)
-        applyCodeButton.setTitle("Apply Code (Join)", for: .normal)
-        applyCodeButton.addTarget(self, action: #selector(applyConnectionCode), for: .touchUpInside)
-        codeButtons.addArrangedSubview(copyCodeButton)
-        codeButtons.addArrangedSubview(applyCodeButton)
-        stack.addArrangedSubview(codeButtons)
+        joinConnectionButton.setTitle("Join connection", for: .normal)
+        joinConnectionButton.addTarget(self, action: #selector(joinConnectionTapped), for: .touchUpInside)
+        stack.addArrangedSubview(joinConnectionButton)
+
+        hostWaitingRow.axis = .horizontal
+        hostWaitingRow.spacing = 6
+        hostWaitingRow.alignment = .center
+        hostWaitingLabel.numberOfLines = 0
+        hostWaitingLabel.textColor = UiStyle.configText
+        hostWaitingRow.addArrangedSubview(hostWaitingLabel)
+        copyConnectionIconButton.setImage(UIImage(systemName: "doc.on.doc"), for: .normal)
+        copyConnectionIconButton.tintColor = UiStyle.configText
+        copyConnectionIconButton.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        copyConnectionIconButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        copyConnectionIconButton.addTarget(self, action: #selector(copyCode), for: .touchUpInside)
+        hostWaitingRow.addArrangedSubview(copyConnectionIconButton)
+        stack.addArrangedSubview(hostWaitingRow)
+
+        joinTargetLabel.numberOfLines = 0
+        joinTargetLabel.textColor = UiStyle.configText
+        stack.addArrangedSubview(joinTargetLabel)
+
+        cancelConnectionButton.setTitle("Cancel", for: .normal)
+        cancelConnectionButton.addTarget(self, action: #selector(cancelConnectionTapped), for: .touchUpInside)
+        stack.addArrangedSubview(cancelConnectionButton)
 
         startButton.setTitle("Start Game", for: .normal)
-        startButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 18)
+        startButton.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .bold)
         startButton.addTarget(self, action: #selector(startGame), for: .touchUpInside)
         stack.addArrangedSubview(startButton)
 
         statusLabel.numberOfLines = 0
-        statusLabel.textColor = .secondaryLabel
+        statusLabel.textColor = UiStyle.configText
         stack.addArrangedSubview(statusLabel)
 
+        // Hook change events.
+        netplaySwitch.addTarget(self, action: #selector(netplayToggled), for: .valueChanged)
+        showTouchSwitch.addTarget(self, action: #selector(anySettingChanged), for: .valueChanged)
+        showSaveSwitch.addTarget(self, action: #selector(anySettingChanged), for: .valueChanged)
+        localPortField.addTarget(self, action: #selector(anySettingChanged), for: .editingChanged)
+
         loadPrefs()
+        applyConfigTheme()
+        applyInteractiveTheme()
         updateRomLabel()
-        setStatus("Note: iOS needs a bundled iOS libretro core (Resources/cores or Frameworks).")
+        applyConnectionUiState(.idle)
+        updateStartButtonEnabled()
+        setStatus("")
     }
 
-    private func makeSectionTitle(_ text: String) -> UILabel {
-        let l = UILabel()
-        l.text = text
-        l.font = UIFont.boldSystemFont(ofSize: 18)
-        return l
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        navigationController?.setNavigationBarHidden(true, animated: animated)
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        navigationController?.setNavigationBarHidden(false, animated: animated)
     }
 
     private func makeRow(label: String, control: UIView) -> UIView {
@@ -161,6 +228,7 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
 
         let l = UILabel()
         l.text = label
+        l.textColor = UiStyle.configText
         l.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         control.setContentHuggingPriority(.required, for: .horizontal)
@@ -170,18 +238,57 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
         return row
     }
 
+    private func applyConfigTheme() {
+        view.backgroundColor = UiStyle.configBackground
+        stack.backgroundColor = UiStyle.configBackground
+
+        // Hint color matches Android: text with alpha 160.
+        let hint = UiStyle.configText.withAlphaComponent(160.0 / 255.0)
+        romPathField.attributedPlaceholder = NSAttributedString(string: romPathField.placeholder ?? "", attributes: [.foregroundColor: hint])
+        localPortField.attributedPlaceholder = NSAttributedString(string: localPortField.placeholder ?? "", attributes: [.foregroundColor: hint])
+    }
+
+    private func applyInteractiveTheme() {
+        applyButtonTheme(pickRomButton)
+        applyButtonTheme(startConnectionButton)
+        applyButtonTheme(joinConnectionButton)
+        applyButtonTheme(cancelConnectionButton)
+        applyButtonTheme(startButton)
+
+        applySwitchTheme(netplaySwitch)
+        applySwitchTheme(showTouchSwitch)
+        applySwitchTheme(showSaveSwitch)
+    }
+
+    private func applyButtonTheme(_ b: UIButton) {
+        let enabledBg = UiStyle.enabledButtonBg
+        let disabledBg = UiStyle.disabledButtonBg
+        let enabledText = UiStyle.enabledButtonText
+        let disabledText = UiStyle.disabledButtonText
+
+        let en = b.isEnabled
+        b.setTitleColor(en ? enabledText : disabledText, for: .normal)
+        b.backgroundColor = en ? enabledBg : disabledBg
+        b.layer.cornerRadius = 10
+        b.contentEdgeInsets = UIEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+    }
+
+    private func applySwitchTheme(_ s: UISwitch) {
+        // Approximate Android's thumb/track tint behavior.
+        s.onTintColor = UiStyle.switchTrackChecked
+        s.thumbTintColor = s.isOn ? UiStyle.switchChecked : UiStyle.switchUnchecked
+    }
+
     private func loadPrefs() {
         let d = UserDefaults.standard
         netplaySwitch.isOn = d.bool(forKey: Keys.enableNetplay)
         showTouchSwitch.isOn = d.object(forKey: Keys.showOnscreenControls) == nil ? true : d.bool(forKey: Keys.showOnscreenControls)
         showSaveSwitch.isOn = d.bool(forKey: Keys.showSaveButton)
 
-        remoteHostField.text = d.string(forKey: Keys.remoteHost) ?? ""
-        remotePortField.text = String(d.integer(forKey: Keys.remotePort) == 0 ? 7000 : d.integer(forKey: Keys.remotePort))
         localPortField.text = String(d.integer(forKey: Keys.localPort) == 0 ? 7000 : d.integer(forKey: Keys.localPort))
-        localPlayerField.text = String(d.integer(forKey: Keys.localPlayerNum) == 0 ? 1 : d.integer(forKey: Keys.localPlayerNum))
 
-        connectionCodeField.text = d.string(forKey: Keys.connectionCode) ?? ""
+        let savedCode = d.string(forKey: Keys.connectionCode) ?? ""
+        connectionCodeField.text = savedCode
 
         if let data = d.data(forKey: Keys.romBookmark) {
             var stale = false
@@ -199,10 +306,7 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
         d.set(netplaySwitch.isOn, forKey: Keys.enableNetplay)
         d.set(showTouchSwitch.isOn, forKey: Keys.showOnscreenControls)
         d.set(showSaveSwitch.isOn, forKey: Keys.showSaveButton)
-        d.set(remoteHostField.text ?? "", forKey: Keys.remoteHost)
-        d.set(parseInt(remotePortField.text, fallback: 7000), forKey: Keys.remotePort)
         d.set(parseInt(localPortField.text, fallback: 7000), forKey: Keys.localPort)
-        d.set(parseInt(localPlayerField.text, fallback: 1), forKey: Keys.localPlayerNum)
         d.set(connectionCodeField.text ?? "", forKey: Keys.connectionCode)
 
         if let url = romURL {
@@ -217,14 +321,164 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
 
     private func updateRomLabel() {
         if let url = romURL {
-            romLabel.text = "ROM: \(url.lastPathComponent)"
+            romPathField.text = url.lastPathComponent
         } else {
-            romLabel.text = "ROM: (none)"
+            romPathField.text = ""
         }
     }
 
     private func setStatus(_ msg: String) {
         statusLabel.text = msg
+    }
+
+    private func isValidPort(_ p: Int) -> Bool {
+        return p >= 1 && p <= 65535
+    }
+
+    private func updateStartButtonEnabled() {
+        // Core must exist in the bundle.
+        let coreOk = (resolveBundledCoreURL() != nil)
+        let romOk = (romURL != nil)
+        let port = parseInt(localPortField.text, fallback: 7000)
+        let portOk = isValidPort(port)
+
+        var enabled = coreOk && romOk && portOk
+        if netplaySwitch.isOn {
+            enabled = enabled && (connectionUiState == .hostReady || connectionUiState == .joinReady)
+        }
+
+        startButton.isEnabled = enabled
+        applyInteractiveTheme()
+    }
+
+    private func applyConnectionUiState(_ st: ConnectionUiState) {
+        connectionUiState = st
+
+        let showNetplay = netplaySwitch.isOn
+        let effective: ConnectionUiState = showNetplay ? st : .idle
+
+        orLabel.isHidden = (effective != .idle)
+
+        startConnectionButton.isHidden = (effective == .joinInput || effective == .joinReady)
+
+        joinConnectionButton.isHidden = (effective == .hostReady || effective == .joinReady)
+        joinConnectionButton.setTitle((effective == .joinInput || effective == .joinReady) ? "ACCEPT" : "Join connection", for: .normal)
+
+        connectionCodeField.isHidden = !(effective == .joinInput || effective == .joinReady)
+        connectionCodeField.isEditable = (effective != .joinReady)
+
+        let showHostWaiting = (effective == .hostReady && !lastHostPublicEndpoint.isEmpty)
+        hostWaitingRow.isHidden = !showHostWaiting
+        hostWaitingLabel.text = showHostWaiting ? ("The other player should connect at \(lastHostPublicEndpoint)") : ""
+        copyConnectionIconButton.isHidden = !showHostWaiting
+
+        if effective == .joinReady {
+            let d = UserDefaults.standard
+            let host = d.string(forKey: Keys.remoteHost) ?? ""
+            let port = d.integer(forKey: Keys.remotePort)
+            if !host.isEmpty && port > 0 {
+                joinTargetLabel.text = "Will connect to \(host):\(port)"
+                joinTargetLabel.isHidden = false
+            } else {
+                joinTargetLabel.isHidden = true
+            }
+        } else {
+            joinTargetLabel.isHidden = true
+        }
+
+        cancelConnectionButton.isHidden = (effective == .idle)
+        startConnectionButton.isEnabled = showNetplay
+        joinConnectionButton.isEnabled = showNetplay
+        applyInteractiveTheme()
+        updateStartButtonEnabled()
+    }
+
+    @objc private func netplayToggled() {
+        if !netplaySwitch.isOn {
+            applyConnectionUiState(.idle)
+        } else {
+            applyConnectionUiState(.idle)
+        }
+        updateStartButtonEnabled()
+    }
+
+    @objc private func anySettingChanged() {
+        applySwitchTheme(netplaySwitch)
+        applySwitchTheme(showTouchSwitch)
+        applySwitchTheme(showSaveSwitch)
+        updateStartButtonEnabled()
+    }
+
+    @objc private func startConnectionTapped() {
+        let lp = parseInt(localPortField.text, fallback: 7000)
+        guard isValidPort(lp) else {
+            setStatus("Local UDP port must be 1..65535")
+            return
+        }
+
+        netplaySwitch.isOn = true
+        applySwitchTheme(netplaySwitch)
+        setStatus("Discovering public endpoint...")
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let mapped = NativeBridgeIOS.stunMappedAddress(localPort: lp)
+            let code = ConnectionCode.encode(publicEndpoint: mapped)
+            DispatchQueue.main.async {
+                if code.isEmpty {
+                    self.setStatus("STUN failed (or no network).")
+                    self.applyConnectionUiState(.idle)
+                    return
+                }
+                self.connectionCodeField.text = code
+                self.lastHostPublicEndpoint = mapped
+
+                // Host is Player 1.
+                let d = UserDefaults.standard
+                d.set(1, forKey: Keys.localPlayerNum)
+                d.set("", forKey: Keys.remoteHost)
+                d.set(7000, forKey: Keys.remotePort)
+
+                self.setStatus("Paste the code on the other device and press Join connection")
+                self.applyConnectionUiState(.hostReady)
+            }
+        }
+    }
+
+    @objc private func joinConnectionTapped() {
+        switch connectionUiState {
+        case .idle:
+            netplaySwitch.isOn = true
+            applySwitchTheme(netplaySwitch)
+            setStatus("Paste the code")
+            applyConnectionUiState(.joinInput)
+        case .joinInput:
+            do {
+                let ep = try ConnectionCode.decodePublicEndpoint(from: connectionCodeField.text ?? "")
+                let d = UserDefaults.standard
+                d.set(ep.host, forKey: Keys.remoteHost)
+                d.set(ep.port, forKey: Keys.remotePort)
+                d.set(2, forKey: Keys.localPlayerNum)
+                setStatus("")
+                applyConnectionUiState(.joinReady)
+            } catch {
+                setStatus("Invalid code: \(error.localizedDescription)")
+            }
+        default:
+            break
+        }
+    }
+
+    @objc private func cancelConnectionTapped() {
+        let d = UserDefaults.standard
+        d.set("", forKey: Keys.connectionCode)
+        d.set(1, forKey: Keys.localPlayerNum)
+        d.set("", forKey: Keys.remoteHost)
+        d.set(0, forKey: Keys.remotePort)
+        lastHostPublicEndpoint = ""
+        connectionCodeField.text = ""
+        setStatus("")
+        applyConnectionUiState(.idle)
+        updateStartButtonEnabled()
     }
 
     private func resolveBundledCoreURL() -> (url: URL, relPath: String)? {
@@ -258,6 +512,14 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
     private func parseInt(_ s: String?, fallback: Int) -> Int {
         guard let s = s, let v = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) else { return fallback }
         return v
+    }
+
+    func textFieldShouldBeginEditing(_ textField: UITextField) -> Bool {
+        if textField === romPathField {
+            pickRom()
+            return false
+        }
+        return true
     }
 
     @objc private func pickRom() {
@@ -302,11 +564,13 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
 
                 romURL = destURL
                 updateRomLabel()
-                setStatus("Imported ROM: \(destURL.lastPathComponent)")
+                setStatus("ROM copied to: \(destURL.lastPathComponent)")
+                updateStartButtonEnabled()
             } catch {
                 romURL = pickedURL
                 updateRomLabel()
                 setStatus("Selected ROM: \(pickedURL.lastPathComponent) (import failed: \(error.localizedDescription))")
+                updateStartButtonEnabled()
             }
         }
 
@@ -315,12 +579,26 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
             romURL = pickedURL
             updateRomLabel()
             setStatus("Selected ROM: \(pickedURL.lastPathComponent) (import failed: \(coordError.localizedDescription))")
+            updateStartButtonEnabled()
         }
     }
 
     @objc private func startGame() {
         guard let romURL else {
             setStatus("Pick a ROM")
+            return
+        }
+
+        updateStartButtonEnabled()
+        guard startButton.isEnabled else {
+            // Mirror Android's behavior: show a helpful status instead of doing nothing.
+            if resolveBundledCoreURL() == nil {
+                setStatus("Missing core")
+            } else if !isValidPort(parseInt(localPortField.text, fallback: 7000)) {
+                setStatus("Local UDP port must be 1..65535")
+            } else if netplaySwitch.isOn {
+                setStatus("Press Start connection first")
+            }
             return
         }
 
@@ -351,10 +629,10 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
             stateURL: stateURL,
             saveURL: saveURL,
             enableNetplay: netplaySwitch.isOn,
-            remoteHost: remoteHostField.text ?? "",
-            remotePort: parseInt(remotePortField.text, fallback: 7000),
+            remoteHost: UserDefaults.standard.string(forKey: Keys.remoteHost) ?? "",
+            remotePort: UserDefaults.standard.integer(forKey: Keys.remotePort) == 0 ? 7000 : UserDefaults.standard.integer(forKey: Keys.remotePort),
             localPort: parseInt(localPortField.text, fallback: 7000),
-            localPlayerNum: parseInt(localPlayerField.text, fallback: 1),
+            localPlayerNum: UserDefaults.standard.integer(forKey: Keys.localPlayerNum) == 0 ? 1 : UserDefaults.standard.integer(forKey: Keys.localPlayerNum),
             showOnscreenControls: showTouchSwitch.isOn,
             showSaveButton: showSaveSwitch.isOn,
             roomServerUrl: "",
@@ -365,41 +643,11 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate 
         navigationController?.pushViewController(vc, animated: true)
     }
 
-    @objc private func generateHostCode() {
-        let lp = parseInt(localPortField.text, fallback: 7000)
-        setStatus("Querying STUN for mapped address...")
-        DispatchQueue.global(qos: .userInitiated).async {
-            let mapped = NativeBridgeIOS.stunMappedAddress(localPort: lp)
-            let code = ConnectionCode.encode(publicEndpoint: mapped)
-            DispatchQueue.main.async {
-                if code.isEmpty {
-                    self.setStatus("STUN failed (or no network). Try again or enter remote host manually.")
-                } else {
-                    self.connectionCodeField.text = code
-                    self.setStatus("Host code generated. Share it with Player 2.")
-                }
-            }
-        }
-    }
-
-    @objc private func applyConnectionCode() {
-        do {
-            let ep = try ConnectionCode.decodePublicEndpoint(from: connectionCodeField.text ?? "")
-            remoteHostField.text = ep.host
-            remotePortField.text = String(ep.port)
-            localPlayerField.text = "2"
-            netplaySwitch.isOn = true
-            setStatus("Applied code. You are Player 2 (join).")
-        } catch {
-            setStatus("Invalid code: \(error.localizedDescription)")
-        }
-    }
-
     @objc private func copyCode() {
         let s = (connectionCodeField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return }
         UIPasteboard.general.string = s
-        setStatus("Copied connection code")
+        setStatus("Copied")
     }
 }
 
