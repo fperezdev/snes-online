@@ -1,6 +1,5 @@
 import UIKit
 import UniformTypeIdentifiers
-import CryptoKit
 
 final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate, UITextFieldDelegate {
     private enum Keys {
@@ -12,6 +11,9 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         static let localPlayerNum = "localPlayerNum"
         static let showOnscreenControls = "showOnscreenControls"
         static let showSaveButton = "showSaveButton"
+        static let connectionString = "connectionString"
+        static let sharedSecret = "sharedSecret"
+        // Back-compat (older builds stored SNO2:... here)
         static let connectionCode = "connectionCode"
     }
 
@@ -42,6 +44,7 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
     private let netplayTitleLabel = UILabel()
     private let netplaySwitch = UISwitch()
     private let localPortField = UITextField()
+    private let secretField = UITextField()
 
     private let startConnectionButton = UIButton(type: .system)
     private let orLabel = UILabel()
@@ -61,7 +64,7 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
     private var romURL: URL?
 
     private var connectionUiState: ConnectionUiState = .idle
-    private var lastHostPublicEndpoint: String = "" // ip:port
+    private var lastHostConnectionString: String = "" // ip:port:secret
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -132,6 +135,14 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         localPortField.textColor = UiStyle.configText
         stack.addArrangedSubview(localPortField)
 
+        secretField.borderStyle = .roundedRect
+        secretField.placeholder = "Secret word (required)"
+        secretField.keyboardType = .default
+        secretField.autocapitalizationType = .none
+        secretField.autocorrectionType = .no
+        secretField.textColor = UiStyle.configText
+        stack.addArrangedSubview(secretField)
+
         startConnectionButton.setTitle("Start connection", for: .normal)
         startConnectionButton.addTarget(self, action: #selector(startConnectionTapped), for: .touchUpInside)
         stack.addArrangedSubview(startConnectionButton)
@@ -191,6 +202,7 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         showTouchSwitch.addTarget(self, action: #selector(anySettingChanged), for: .valueChanged)
         showSaveSwitch.addTarget(self, action: #selector(anySettingChanged), for: .valueChanged)
         localPortField.addTarget(self, action: #selector(anySettingChanged), for: .editingChanged)
+        secretField.addTarget(self, action: #selector(anySettingChanged), for: .editingChanged)
 
         loadPrefs()
         applyConfigTheme()
@@ -237,14 +249,18 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         let hint = UiStyle.configText.withAlphaComponent(160.0 / 255.0)
         romPathField.attributedPlaceholder = NSAttributedString(string: romPathField.placeholder ?? "", attributes: [.foregroundColor: hint])
         localPortField.attributedPlaceholder = NSAttributedString(string: localPortField.placeholder ?? "", attributes: [.foregroundColor: hint])
+        secretField.attributedPlaceholder = NSAttributedString(string: secretField.placeholder ?? "", attributes: [.foregroundColor: hint])
 
         // Ensure text inputs match the app palette.
         romPathField.textColor = UiStyle.configText
         localPortField.textColor = UiStyle.configText
+        secretField.textColor = UiStyle.configText
         romPathField.tintColor = UiStyle.accent2
         localPortField.tintColor = UiStyle.accent2
+        secretField.tintColor = UiStyle.accent2
         romPathField.backgroundColor = UiStyle.primaryBase.withAlphaComponent(0.35)
         localPortField.backgroundColor = UiStyle.primaryBase.withAlphaComponent(0.35)
+        secretField.backgroundColor = UiStyle.primaryBase.withAlphaComponent(0.35)
     }
 
     private func applyInteractiveTheme() {
@@ -286,8 +302,15 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
 
         localPortField.text = String(d.integer(forKey: Keys.localPort) == 0 ? 7000 : d.integer(forKey: Keys.localPort))
 
-        let savedCode = d.string(forKey: Keys.connectionCode) ?? ""
-        connectionCodeField.text = savedCode
+        let savedSecret = d.string(forKey: Keys.sharedSecret) ?? ""
+        secretField.text = savedSecret
+
+        var savedConn = d.string(forKey: Keys.connectionString) ?? ""
+        if savedConn.isEmpty {
+            // Back-compat
+            savedConn = d.string(forKey: Keys.connectionCode) ?? ""
+        }
+        connectionCodeField.text = savedConn
 
         if let data = d.data(forKey: Keys.romBookmark) {
             var stale = false
@@ -306,7 +329,8 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         d.set(showTouchSwitch.isOn, forKey: Keys.showOnscreenControls)
         d.set(showSaveSwitch.isOn, forKey: Keys.showSaveButton)
         d.set(parseInt(localPortField.text, fallback: 7000), forKey: Keys.localPort)
-        d.set(connectionCodeField.text ?? "", forKey: Keys.connectionCode)
+        d.set((connectionCodeField.text ?? ""), forKey: Keys.connectionString)
+        d.set((secretField.text ?? ""), forKey: Keys.sharedSecret)
 
         if let url = romURL {
             let opts: URL.BookmarkCreationOptions = []
@@ -343,7 +367,8 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
 
         var enabled = coreOk && romOk && portOk
         if netplaySwitch.isOn {
-            enabled = enabled && (connectionUiState == .hostReady || connectionUiState == .joinReady)
+            let secretOk = !(secretField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            enabled = enabled && secretOk && (connectionUiState == .hostReady || connectionUiState == .joinReady)
         }
 
         startButton.isEnabled = enabled
@@ -366,9 +391,9 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         connectionCodeField.isHidden = !(effective == .joinInput || effective == .joinReady)
         connectionCodeField.isEditable = (effective != .joinReady)
 
-        let showHostWaiting = (effective == .hostReady && !lastHostPublicEndpoint.isEmpty)
+        let showHostWaiting = (effective == .hostReady && !lastHostConnectionString.isEmpty)
         hostWaitingRow.isHidden = !showHostWaiting
-        hostWaitingLabel.text = showHostWaiting ? ("The other player should connect at \(lastHostPublicEndpoint)") : ""
+        hostWaitingLabel.text = showHostWaiting ? ("Share: \(lastHostConnectionString)") : ""
         copyConnectionIconButton.isHidden = !showHostWaiting
 
         if effective == .joinReady {
@@ -376,7 +401,7 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
             let host = d.string(forKey: Keys.remoteHost) ?? ""
             let port = d.integer(forKey: Keys.remotePort)
             if !host.isEmpty && port > 0 {
-                joinTargetLabel.text = "Will connect to \(host):\(port)"
+                joinTargetLabel.text = "Will connect to \(host):\(port) (secret set)"
                 joinTargetLabel.isHidden = false
             } else {
                 joinTargetLabel.isHidden = true
@@ -415,13 +440,30 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
             return
         }
 
+        let secret = (secretField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !secret.isEmpty else {
+            setStatus("Secret word is required")
+            return
+        }
+        guard !secret.contains(":") else {
+            setStatus("Secret cannot contain ':'")
+            return
+        }
+
         netplaySwitch.isOn = true
         applySwitchTheme(netplaySwitch)
         setStatus("Discovering public endpoint...")
 
         DispatchQueue.global(qos: .userInitiated).async {
             let mapped = NativeBridgeIOS.stunMappedAddress(localPort: lp)
-            let code = ConnectionCode.encode(publicEndpoint: mapped)
+            let code: String
+            do {
+                let hp = try Self.parseHostPort(mapped)
+                let hostPort = Self.canonicalizeHostPortForShare(host: hp.host, port: hp.port)
+                code = "\(hostPort):\(secret)"
+            } catch {
+                code = ""
+            }
             DispatchQueue.main.async {
                 if code.isEmpty {
                     self.setStatus("STUN failed (or no network).")
@@ -429,7 +471,7 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
                     return
                 }
                 self.connectionCodeField.text = code
-                self.lastHostPublicEndpoint = mapped
+                self.lastHostConnectionString = code
 
                 // Host is Player 1.
                 let d = UserDefaults.standard
@@ -437,8 +479,11 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
                 d.set("", forKey: Keys.remoteHost)
                 d.set(0, forKey: Keys.remotePort)
                 d.set(lp, forKey: Keys.localPort)
+                d.set(secret, forKey: Keys.sharedSecret)
+                d.set(code, forKey: Keys.connectionString)
 
-                self.setStatus("Paste the code on the other device and press Join connection")
+                UIPasteboard.general.string = code
+                self.setStatus("Copied connection string")
                 self.applyConnectionUiState(.hostReady)
             }
         }
@@ -449,19 +494,22 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         case .idle:
             netplaySwitch.isOn = true
             applySwitchTheme(netplaySwitch)
-            setStatus("Paste the code")
+            setStatus("Paste the connection string")
             applyConnectionUiState(.joinInput)
         case .joinInput:
             do {
-                let ep = try ConnectionCode.decodePublicEndpoint(from: connectionCodeField.text ?? "")
+                let parsed = try Self.parseConnectionString(connectionCodeField.text ?? "")
                 let d = UserDefaults.standard
-                d.set(ep.host, forKey: Keys.remoteHost)
-                d.set(ep.port, forKey: Keys.remotePort)
+                d.set(parsed.host, forKey: Keys.remoteHost)
+                d.set(parsed.port, forKey: Keys.remotePort)
                 d.set(2, forKey: Keys.localPlayerNum)
+                d.set(parsed.secret, forKey: Keys.sharedSecret)
+                d.set(connectionCodeField.text ?? "", forKey: Keys.connectionString)
+                secretField.text = parsed.secret
                 setStatus("")
                 applyConnectionUiState(.joinReady)
             } catch {
-                setStatus("Invalid code: \(error.localizedDescription)")
+                setStatus("Invalid connection string: \(error.localizedDescription)")
             }
         default:
             break
@@ -470,11 +518,13 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
 
     @objc private func cancelConnectionTapped() {
         let d = UserDefaults.standard
+        d.set("", forKey: Keys.connectionString)
+        d.set("", forKey: Keys.sharedSecret)
         d.set("", forKey: Keys.connectionCode)
         d.set(1, forKey: Keys.localPlayerNum)
         d.set("", forKey: Keys.remoteHost)
         d.set(0, forKey: Keys.remotePort)
-        lastHostPublicEndpoint = ""
+        lastHostConnectionString = ""
         connectionCodeField.text = ""
         setStatus("")
         applyConnectionUiState(.idle)
@@ -636,7 +686,8 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
             showOnscreenControls: showTouchSwitch.isOn,
             showSaveButton: showSaveSwitch.isOn,
             roomServerUrl: "",
-            roomCode: ""
+            roomCode: "",
+            sharedSecret: UserDefaults.standard.string(forKey: Keys.sharedSecret) ?? ""
         )
 
         let vc = IOSGameViewController(config: cfg)
@@ -644,43 +695,79 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
     }
 
     @objc private func copyCode() {
-        let code = (connectionCodeField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !code.isEmpty else { return }
-        var comps = URLComponents()
-        comps.scheme = "snesonline"
-        comps.host = "join"
-        comps.queryItems = [URLQueryItem(name: "code", value: code)]
-        let link = comps.url?.absoluteString ?? code
-        UIPasteboard.general.string = link
-        setStatus("Copied invite link")
+        let s = (connectionCodeField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return }
+        UIPasteboard.general.string = s
+        setStatus("Copied connection string")
     }
 
-    // Deep-link entrypoint: snesonline://join?code=SNO2:...
-    func applyInviteLink(_ url: URL) {
-        guard url.scheme?.lowercased() == "snesonline" else { return }
-        guard url.host?.lowercased() == "join" else { return }
-        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }
-        guard let code = comps.queryItems?.first(where: { $0.name == "code" })?.value, !code.isEmpty else { return }
+    private struct HostPort {
+        let host: String
+        let port: Int
+    }
 
-        netplaySwitch.isOn = true
-        applySwitchTheme(netplaySwitch)
-        connectionCodeField.text = code
-        UserDefaults.standard.set(code, forKey: Keys.connectionCode)
+    private struct ParsedConnectionString {
+        let host: String
+        let port: Int
+        let secret: String
+    }
 
-        // Attempt to auto-accept the join code.
-        do {
-            let ep = try ConnectionCode.decodePublicEndpoint(from: code)
-            let d = UserDefaults.standard
-            d.set(ep.host, forKey: Keys.remoteHost)
-            d.set(ep.port, forKey: Keys.remotePort)
-            d.set(2, forKey: Keys.localPlayerNum)
-            setStatus("")
-            applyConnectionUiState(.joinReady)
-        } catch {
-            setStatus("Paste the code")
-            applyConnectionUiState(.joinInput)
+    private static func canonicalizeHostPortForShare(host: String, port: Int) -> String {
+        let h = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        return "\(h):\(port)"
+    }
+
+    private static func parseHostPort(_ s: String) throws -> HostPort {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else {
+            throw NSError(domain: "ConnectionString", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing host/port"])
         }
-        updateStartButtonEnabled()
+
+        if t.hasPrefix("[") {
+            guard let r = t.firstIndex(of: "]") else {
+                throw NSError(domain: "ConnectionString", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid IPv6 bracket"])
+            }
+            let host = String(t[t.index(after: t.startIndex)..<r])
+            let after = t[t.index(after: r)...]
+            guard after.hasPrefix(":") else {
+                throw NSError(domain: "ConnectionString", code: 3, userInfo: [NSLocalizedDescriptionKey: "Missing port"])
+            }
+            let portStr = String(after.dropFirst())
+            guard let port = Int(portStr), port >= 1, port <= 65535 else {
+                throw NSError(domain: "ConnectionString", code: 4, userInfo: [NSLocalizedDescriptionKey: "Invalid port"])
+            }
+            return HostPort(host: host, port: port)
+        }
+
+        guard let lastColon = t.lastIndex(of: ":") else {
+            throw NSError(domain: "ConnectionString", code: 5, userInfo: [NSLocalizedDescriptionKey: "Expected host:port"])
+        }
+        let host = String(t[..<lastColon])
+        let portStr = String(t[t.index(after: lastColon)...])
+        guard !host.isEmpty, let port = Int(portStr), port >= 1, port <= 65535 else {
+            throw NSError(domain: "ConnectionString", code: 6, userInfo: [NSLocalizedDescriptionKey: "Invalid host/port"])
+        }
+        return HostPort(host: host, port: port)
+    }
+
+    private static func parseConnectionString(_ s: String) throws -> ParsedConnectionString {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else {
+            throw NSError(domain: "ConnectionString", code: 10, userInfo: [NSLocalizedDescriptionKey: "Empty"])
+        }
+        guard let lastColon = t.lastIndex(of: ":") else {
+            throw NSError(domain: "ConnectionString", code: 11, userInfo: [NSLocalizedDescriptionKey: "Expected ip:port:secret"])
+        }
+        let hostPortStr = String(t[..<lastColon])
+        let secret = String(t[t.index(after: lastColon)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !secret.isEmpty else {
+            throw NSError(domain: "ConnectionString", code: 12, userInfo: [NSLocalizedDescriptionKey: "Secret is required"])
+        }
+        guard !secret.contains(":") else {
+            throw NSError(domain: "ConnectionString", code: 13, userInfo: [NSLocalizedDescriptionKey: "Secret cannot contain ':'"])
+        }
+        let hp = try parseHostPort(hostPortStr)
+        return ParsedConnectionString(host: hp.host, port: hp.port, secret: secret)
     }
 }
 
@@ -698,101 +785,5 @@ struct IOSGameConfig {
     let showSaveButton: Bool
     let roomServerUrl: String
     let roomCode: String
-}
-
-private enum ConnectionCode {
-    struct Endpoint {
-        let host: String
-        let port: Int
-    }
-
-    static func encode(publicEndpoint: String) -> String {
-        let trimmed = publicEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.contains(":") else { return "" }
-
-        let payload = "v=2&pub=\(trimmed)"
-        let sig = shortSigB64Url(payload)
-        let full = sig.isEmpty ? payload : (payload + "&sig=\(sig)")
-        guard let data = full.data(using: .utf8) else { return "" }
-        return "SNO2:" + base64UrlNoPad(data)
-    }
-
-    static func decodePublicEndpoint(from code: String) throws -> Endpoint {
-        let t = code.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard t.hasPrefix("SNO2:") || t.hasPrefix("SNO1:") else {
-            throw NSError(domain: "ConnectionCode", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing SNO prefix"])
-        }
-        let b64 = String(t.dropFirst(5))
-        guard let data = base64UrlDecode(b64),
-              let payload = String(data: data, encoding: .utf8) else {
-            throw NSError(domain: "ConnectionCode", code: 2, userInfo: [NSLocalizedDescriptionKey: "Malformed base64"])
-        }
-        let parts = payload.split(separator: "&")
-        var pub: String = ""
-        for part in parts {
-            let kv = part.split(separator: "=", maxSplits: 1)
-            if kv.count == 2 && kv[0] == "pub" { pub = String(kv[1]) }
-        }
-        let trimmed = pub.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Missing valid public endpoint"])
-        }
-
-        // Supports:
-        // - ipv4:port
-        // - hostname:port
-        // - [ipv6]:port
-        // - (best-effort) raw ipv6 with port appended (split on last ':')
-        if trimmed.hasPrefix("[") {
-            guard let r = trimmed.firstIndex(of: "]") else {
-                throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid public endpoint"])
-            }
-            let host = String(trimmed[trimmed.index(after: trimmed.startIndex)..<r])
-            let after = trimmed[trimmed.index(after: r)...]
-            guard after.hasPrefix(":") else {
-                throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid public endpoint"])
-            }
-            let portStr = String(after.dropFirst())
-            guard let port = Int(portStr), port >= 1, port <= 65535 else {
-                throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Missing valid public endpoint"])
-            }
-            return Endpoint(host: host, port: port)
-        }
-
-        guard let lastColon = trimmed.lastIndex(of: ":") else {
-            throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Missing valid public endpoint"])
-        }
-        let host = String(trimmed[..<lastColon])
-        let portStr = String(trimmed[trimmed.index(after: lastColon)...])
-        guard !host.isEmpty, let port = Int(portStr), port >= 1, port <= 65535 else {
-            throw NSError(domain: "ConnectionCode", code: 3, userInfo: [NSLocalizedDescriptionKey: "Missing valid public endpoint"])
-        }
-        return Endpoint(host: host, port: port)
-    }
-
-    private static func shortSigB64Url(_ payload: String) -> String {
-        guard let data = payload.data(using: .utf8) else { return "" }
-        let hash = SHA256.hash(data: data)
-        let bytes = Array(hash)
-        let n = min(12, bytes.count)
-        return base64UrlNoPad(Data(bytes[0..<n]))
-    }
-
-    private static func base64UrlNoPad(_ data: Data) -> String {
-        var s = data.base64EncodedString()
-        s = s.replacingOccurrences(of: "+", with: "-")
-        s = s.replacingOccurrences(of: "/", with: "_")
-        s = s.replacingOccurrences(of: "=", with: "")
-        return s
-    }
-
-    private static func base64UrlDecode(_ s: String) -> Data? {
-        var t = s.replacingOccurrences(of: "-", with: "+")
-        t = t.replacingOccurrences(of: "_", with: "/")
-        let mod = t.count % 4
-        if mod == 2 { t += "==" }
-        else if mod == 3 { t += "=" }
-        else if mod != 0 { return nil }
-        return Data(base64Encoded: t)
-    }
+    let sharedSecret: String
 }

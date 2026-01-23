@@ -235,6 +235,9 @@ struct UdpNetplay {
     uint32_t frame = 0;
 
     bool discoverPeer = false;
+    bool requireSecret = false;
+    uint16_t secret16 = 0;
+    uint32_t secret32 = 0;
 
     static constexpr uint32_t kBufN = 256;
     static constexpr uint32_t kInputDelayFrames = 5;
@@ -624,7 +627,7 @@ struct UdpNetplay {
         return false;
     }
 
-    bool start(const char* remoteHost, uint16_t rPort, uint16_t lPort, uint8_t lPlayer, const char* roomServerUrl, const char* roomCode) noexcept {
+    bool start(const char* remoteHost, uint16_t rPort, uint16_t lPort, uint8_t lPlayer, const char* roomServerUrl, const char* roomCode, const char* sharedSecret) noexcept {
         stop();
 
         localPort = (lPort != 0) ? lPort : 7000;
@@ -657,6 +660,12 @@ struct UdpNetplay {
         lastNatPunchSent = {};
 
         discoverPeer = false;
+
+        requireSecret = (sharedSecret && sharedSecret[0]);
+        secret32 = requireSecret ? crc32_(sharedSecret, std::strlen(sharedSecret)) : 0u;
+        uint32_t mix = secret32 ^ (secret32 >> 16);
+        secret16 = static_cast<uint16_t>(mix & 0xFFFFu);
+        if (requireSecret && secret16 == 0) secret16 = 1;
 
         sock = ::socket(AF_INET6, SOCK_DGRAM, 0);
         if (sock < 0) return false;
@@ -887,6 +896,39 @@ struct UdpNetplay {
             if (n < 8) continue;
 
             const uint32_t magic = read_u32_be_(buf);
+            // If we already have a peer, ignore packets from other IPs.
+            if (hasPeer && remote.sin6_family == AF_INET6 && from.sin6_family == AF_INET6) {
+                if (remote.sin6_scope_id != from.sin6_scope_id || std::memcmp(&remote.sin6_addr, &from.sin6_addr, sizeof(in6_addr)) != 0) {
+                    continue;
+                }
+            }
+
+            // Host auto-discovery: only accept the first peer if it presents the correct secret token.
+            if (discoverPeer && !hasPeer) {
+                if (magic != kMagicInput) continue;
+                if (static_cast<size_t>(n) < sizeof(Packet)) continue;
+                if (requireSecret) {
+                    const uint16_t tok = read_u16_be_(buf + 10);
+                    if (tok != secret16) continue;
+                }
+            }
+
+            // Validate tokens on keepalives and input packets.
+            if (magic == kMagicKeepAlive && requireSecret) {
+                const uint32_t tok = read_u32_be_(buf + 4);
+                if (tok != secret32) continue;
+            }
+            if (magic == kMagicInput && requireSecret) {
+                if (static_cast<size_t>(n) < sizeof(Packet)) continue;
+                const uint16_t tok = read_u16_be_(buf + 10);
+                if (tok != secret16) continue;
+            }
+
+            // For all other packet types, require a discovered peer first.
+            if (!hasPeer && magic != kMagicInput && magic != kMagicKeepAlive) {
+                continue;
+            }
+
             markPeerConnected_(from);
 
             if (magic == kMagicKeepAlive) {
@@ -1083,7 +1125,7 @@ struct UdpNetplay {
 
         uint8_t pkt[8] = {};
         write_u32_be_(pkt, kMagicKeepAlive);
-        write_u32_be_(pkt + 4, 0);
+        write_u32_be_(pkt + 4, requireSecret ? secret32 : 0u);
         sendto(sock, pkt, sizeof(pkt), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
     }
 
@@ -1101,7 +1143,7 @@ struct UdpNetplay {
 
         uint8_t pkt[8] = {};
         write_u32_be_(pkt, kMagicKeepAlive);
-        write_u32_be_(pkt + 4, 0);
+        write_u32_be_(pkt + 4, requireSecret ? secret32 : 0u);
         sendto(sock, pkt, sizeof(pkt), 0, reinterpret_cast<const sockaddr*>(&natPunchTarget), sizeof(natPunchTarget));
     }
 
@@ -1126,7 +1168,7 @@ struct UdpNetplay {
             p.magic_be = htonl(kMagicInput);
             p.frame_be = htonl(f);
             p.mask_be = htons(sentMask[fi]);
-            p.reserved_be = 0;
+            p.reserved_be = htons(requireSecret ? secret16 : 0);
             sendto(sock, &p, sizeof(p), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
         }
     }
@@ -1366,7 +1408,8 @@ bool snesonline_ios_initialize(const char* corePath,
                               int localPort,
                               int localPlayerNum,
                               const char* roomServerUrl,
-                              const char* roomCode) {
+                              const char* roomCode,
+                              const char* sharedSecret) {
     g_running.store(false, std::memory_order_relaxed);
     if (g_loopThread.joinable()) g_loopThread.join();
 
@@ -1423,7 +1466,7 @@ bool snesonline_ios_initialize(const char* corePath,
 
         auto np = std::make_unique<UdpNetplay>();
         const char* host = (remoteHost && remoteHost[0]) ? remoteHost : "";
-        if (np->start(host, rp, lp, pnum, roomServerUrl ? roomServerUrl : "", roomCode ? roomCode : "")) {
+        if (np->start(host, rp, lp, pnum, roomServerUrl ? roomServerUrl : "", roomCode ? roomCode : "", sharedSecret ? sharedSecret : "")) {
             // Host: stage the same state for the peer to load.
             if (pnum == 1 && statePath && statePath[0]) {
                 std::vector<uint8_t> bytes;

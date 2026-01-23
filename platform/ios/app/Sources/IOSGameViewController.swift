@@ -26,6 +26,7 @@ final class IOSGameViewController: UIViewController {
 
     private let backToConfigButton = UIButton(type: .system)
     private let stateButtonOverlay = UIButton(type: .system)
+    private let topPills = UIStackView()
 
     private var waitingInputsSince: CFTimeInterval?
 
@@ -55,24 +56,23 @@ final class IOSGameViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .black
 
-        // Android has no action bar; prefer fullscreen UX.
-        // Provide in-game overlay buttons instead of relying on a hidden nav-bar.
-        backToConfigButton.setTitle("Config", for: .normal)
-        backToConfigButton.setTitleColor(.white, for: .normal)
-        backToConfigButton.backgroundColor = UIColor.black.withAlphaComponent(0.55)
-        backToConfigButton.layer.cornerRadius = 10
-        backToConfigButton.contentEdgeInsets = UIEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        // Tiny top-center overlay pills (Back + State).
+        backToConfigButton.setTitle("Back", for: .normal)
         backToConfigButton.addTarget(self, action: #selector(backToConfigTapped), for: .touchUpInside)
-        backToConfigButton.translatesAutoresizingMaskIntoConstraints = false
 
         stateButtonOverlay.setTitle("State", for: .normal)
-        stateButtonOverlay.setTitleColor(.white, for: .normal)
-        stateButtonOverlay.backgroundColor = UIColor.black.withAlphaComponent(0.55)
-        stateButtonOverlay.layer.cornerRadius = 10
-        stateButtonOverlay.contentEdgeInsets = UIEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
         stateButtonOverlay.addTarget(self, action: #selector(showStateMenu), for: .touchUpInside)
-        stateButtonOverlay.translatesAutoresizingMaskIntoConstraints = false
         stateButtonOverlay.isHidden = !config.showSaveButton
+
+        [backToConfigButton, stateButtonOverlay].forEach(styleTopPill)
+
+        topPills.axis = .horizontal
+        topPills.alignment = .center
+        topPills.distribution = .equalSpacing
+        topPills.spacing = 8
+        topPills.translatesAutoresizingMaskIntoConstraints = false
+        topPills.addArrangedSubview(backToConfigButton)
+        topPills.addArrangedSubview(stateButtonOverlay)
 
         imageView.contentMode = .scaleAspectFit
         imageView.translatesAutoresizingMaskIntoConstraints = false
@@ -86,8 +86,7 @@ final class IOSGameViewController: UIViewController {
 
         view.addSubview(imageView)
         view.addSubview(waitingLabel)
-        view.addSubview(backToConfigButton)
-        view.addSubview(stateButtonOverlay)
+        view.addSubview(topPills)
 
         NSLayoutConstraint.activate([
             imageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -102,11 +101,8 @@ final class IOSGameViewController: UIViewController {
         ])
 
         NSLayoutConstraint.activate([
-            backToConfigButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 14),
-            backToConfigButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
-
-            stateButtonOverlay.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -14),
-            stateButtonOverlay.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10)
+            topPills.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
+            topPills.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8)
         ])
 
         if config.showOnscreenControls {
@@ -116,10 +112,9 @@ final class IOSGameViewController: UIViewController {
                 self?.overlayMask = mask
                 self?.pushInput()
             }
-            ov.showStateButton = config.showSaveButton
-            ov.onStateRequested = { [weak self] in
-                self?.showStateMenu()
-            }
+            // Keep only the top-center State pill; do not show the in-overlay STATE button.
+            ov.showStateButton = false
+            ov.onStateRequested = nil
             view.addSubview(ov)
             NSLayoutConstraint.activate([
                 ov.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -132,6 +127,16 @@ final class IOSGameViewController: UIViewController {
 
         setupControllers()
         startNative()
+    }
+
+    private func styleTopPill(_ button: UIButton) {
+        button.setTitleColor(.white, for: .normal)
+        button.backgroundColor = UIColor.black.withAlphaComponent(0.75)
+        button.titleLabel?.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+        button.contentEdgeInsets = UIEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        button.layer.cornerRadius = 12
+        button.clipsToBounds = true
+        button.translatesAutoresizingMaskIntoConstraints = false
     }
 
     private func startNative() {
@@ -152,7 +157,8 @@ final class IOSGameViewController: UIViewController {
             localPort: config.localPort,
             localPlayerNum: config.localPlayerNum,
             roomServerUrl: config.roomServerUrl,
-            roomCode: config.roomCode
+            roomCode: config.roomCode,
+            sharedSecret: config.sharedSecret
         )
 
         if !ok {
@@ -289,9 +295,12 @@ final class IOSGameViewController: UIViewController {
     }
 
     @objc private func renderTick() {
+        var netplayStatus: Int = 0
+
         // Update netplay waiting UI.
         if config.enableNetplay {
             let st = NativeBridgeIOS.netplayStatus()
+            netplayStatus = st
             if st != 2 { waitingInputsSince = nil }
 
             if st == 1 {
@@ -326,6 +335,13 @@ final class IOSGameViewController: UIViewController {
         let w = NativeBridgeIOS.videoWidth()
         let h = NativeBridgeIOS.videoHeight()
         guard w > 0, h > 0, let ptr = NativeBridgeIOS.videoBufferRGBA() else {
+            // When netplay is waiting (peer/inputs/state sync), the core intentionally doesn't
+            // advance frames; avoid replacing the expected netplay status overlay.
+            if config.enableNetplay && netplayStatus != 3 {
+                noVideoTicks = 0
+                return
+            }
+
             noVideoTicks += 1
             if noVideoTicks >= 60 {
                 waitingLabel.isHidden = false

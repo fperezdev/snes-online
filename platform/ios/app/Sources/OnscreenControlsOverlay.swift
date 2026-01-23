@@ -66,7 +66,8 @@ final class OnscreenControlsOverlay: UIView {
         dpad.layer.borderWidth = 2
         dpad.clipsToBounds = true
 
-        dpadCrossLayer.fillColor = UiStyle.accent2.withAlphaComponent(200.0 / 255.0).cgColor
+        // Match Android's dpad.svg paint: color=#211A21 (UiStyle.textDetail) with alpha=200/255.
+        dpadCrossLayer.fillColor = UiStyle.textDetail.withAlphaComponent(200.0 / 255.0).cgColor
         dpad.layer.addSublayer(dpadCrossLayer)
 
         [a,b,x,y,start,select,state,l,r].forEach { btn in
@@ -132,7 +133,7 @@ final class OnscreenControlsOverlay: UIView {
         dpad.layer.cornerRadius = dSize * 0.5
 
         // D-pad cross (SVG-like) inside the circle.
-        let svgInset: CGFloat = max(6, min(dpad.bounds.width, dpad.bounds.height) * 0.08)
+        let svgInset: CGFloat = max(6, min(dpad.bounds.width, dpad.bounds.height) * 0.09)
         let crossBounds = dpad.bounds.insetBy(dx: svgInset, dy: svgInset)
         dpadCrossLayer.frame = dpad.bounds
         dpadCrossLayer.path = makeDpadCrossPath(in: crossBounds).cgPath
@@ -171,18 +172,52 @@ final class OnscreenControlsOverlay: UIView {
     }
 
     private func makeDpadCrossPath(in rect: CGRect) -> UIBezierPath {
+        // Match Android's dpad.svg (platform/android/app/src/main/res/raw/dpad.svg)
+        // viewBox="0 0 24 24" and a single path with 4 subpaths.
         let path = UIBezierPath()
 
-        let cx = rect.midX
-        let cy = rect.midY
-        let size = min(rect.width, rect.height)
-        let arm = size * 0.18
-        let th = size * 0.13
+        func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(
+                x: rect.minX + (x / 24.0) * rect.width,
+                y: rect.minY + (y / 24.0) * rect.height
+            )
+        }
 
-        // Vertical bar
-        path.append(UIBezierPath(rect: CGRect(x: cx - th * 0.5, y: cy - arm, width: th, height: arm * 2)))
-        // Horizontal bar
-        path.append(UIBezierPath(rect: CGRect(x: cx - arm, y: cy - th * 0.5, width: arm * 2, height: th)))
+        // M15 7.5 V2 H9 v5.5 l3 3 3-3 z
+        path.move(to: p(15, 7.5))
+        path.addLine(to: p(15, 2))
+        path.addLine(to: p(9, 2))
+        path.addLine(to: p(9, 7.5))
+        path.addLine(to: p(12, 10.5))
+        path.addLine(to: p(15, 7.5))
+        path.close()
+
+        // M7.5 9 H2 v6 h5.5 l3-3 -3-3 z
+        path.move(to: p(7.5, 9))
+        path.addLine(to: p(2, 9))
+        path.addLine(to: p(2, 15))
+        path.addLine(to: p(7.5, 15))
+        path.addLine(to: p(10.5, 12))
+        path.addLine(to: p(7.5, 9))
+        path.close()
+
+        // M9 16.5 V22 h6 v-5.5 l-3-3 -3 3 z
+        path.move(to: p(9, 16.5))
+        path.addLine(to: p(9, 22))
+        path.addLine(to: p(15, 22))
+        path.addLine(to: p(15, 16.5))
+        path.addLine(to: p(12, 13.5))
+        path.addLine(to: p(9, 16.5))
+        path.close()
+
+        // M16.5 9 l-3 3 3 3 H22 V9 h-5.5 z
+        path.move(to: p(16.5, 9))
+        path.addLine(to: p(13.5, 12))
+        path.addLine(to: p(16.5, 15))
+        path.addLine(to: p(22, 15))
+        path.addLine(to: p(22, 9))
+        path.addLine(to: p(16.5, 9))
+        path.close()
 
         return path
     }

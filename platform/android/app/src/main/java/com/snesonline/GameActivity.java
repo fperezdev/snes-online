@@ -11,6 +11,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.graphics.drawable.GradientDrawable;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
@@ -18,16 +19,19 @@ import android.media.AudioTrack;
 import android.os.Build;
 import android.os.Process;
 import android.util.Log;
+import android.util.TypedValue;
 import android.view.InputDevice;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.Toast;
 import android.widget.TextView;
 import android.widget.FrameLayout;
+import android.widget.Button;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
@@ -163,6 +167,7 @@ public class GameActivity extends Activity {
         int remotePort = getIntent().getIntExtra("remotePort", 0);
         int localPort = getIntent().getIntExtra("localPort", 7000);
         int localPlayerNum = getIntent().getIntExtra("localPlayerNum", 0);
+        String sharedSecret = getIntent().getStringExtra("sharedSecret");
         String roomServerUrl = getIntent().getStringExtra("roomServerUrl");
         String roomCode = getIntent().getStringExtra("roomCode");
         String roomPassword = getIntent().getStringExtra("roomPassword");
@@ -171,6 +176,7 @@ public class GameActivity extends Activity {
         if (statePath == null) statePath = "";
         if (savePath == null) savePath = "";
         if (remoteHost == null) remoteHost = "";
+        if (sharedSecret == null) sharedSecret = "";
         if (roomServerUrl == null) roomServerUrl = "";
         if (roomCode == null) roomCode = "";
         if (roomPassword == null) roomPassword = "";
@@ -201,6 +207,7 @@ public class GameActivity extends Activity {
                     remotePort,
                     finalLocalPort,
                     1,
+                    "",
                     "",
                     "");
             if (!ok) {
@@ -257,7 +264,8 @@ public class GameActivity extends Activity {
                         finalLocalPort,
                         directRole,
                         "",
-                        "");
+                    "",
+                    sharedSecret);
                 if (!ok) throw new Exception("Native init failed");
 
                 initVideo();
@@ -297,6 +305,7 @@ public class GameActivity extends Activity {
                         resolvedRemotePort,
                         finalLocalPort,
                         resolvedLocalPlayerNum,
+                        "",
                         "",
                         "");
                 if (!ok) throw new Exception("Native init failed");
@@ -580,11 +589,19 @@ public class GameActivity extends Activity {
 
                 // Host-only rule (netplay): only host can save/load.
                 final boolean canUseSaveLoad = showSaveButtonIntent && (!enableNetplayIntent || localPlayerNumIntent == 1);
-                onscreenControls.setShowStateButton(canUseSaveLoad);
-                onscreenControls.setOnStateRequested(() -> ui.post(this::showStateDialog));
+                // Keep only the top-center State pill; do not show the in-overlay STATE button.
+                onscreenControls.setShowStateButton(false);
+                onscreenControls.setOnStateRequested(null);
                 gameRoot.addView(onscreenControls, new FrameLayout.LayoutParams(
                         FrameLayout.LayoutParams.MATCH_PARENT,
                         FrameLayout.LayoutParams.MATCH_PARENT));
+
+                // Tiny top-center pills (Back + State).
+                addTopPillButtons(gameRoot, canUseSaveLoad);
+            } else {
+                // Still show Back/State pills even when on-screen controls are off.
+                final boolean canUseSaveLoad = showSaveButtonIntent && (!enableNetplayIntent || localPlayerNumIntent == 1);
+                addTopPillButtons(gameRoot, canUseSaveLoad);
             }
         }
 
@@ -595,6 +612,64 @@ public class GameActivity extends Activity {
         running = true;
         startAudioThread();
         startRenderLoop();
+    }
+
+    private void addTopPillButtons(FrameLayout root, boolean showState) {
+        final LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER);
+
+        final Button back = new Button(this);
+        styleTopPill(back);
+        back.setText("Back");
+        back.setOnClickListener(v -> finish());
+
+        final Button state = new Button(this);
+        styleTopPill(state);
+        state.setText("State");
+        state.setOnClickListener(v -> ui.post(this::showStateDialog));
+        state.setVisibility(showState ? View.VISIBLE : View.GONE);
+
+        bar.addView(back, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout.LayoutParams stLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        stLp.leftMargin = dp(8);
+        bar.addView(state, stLp);
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT);
+        lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        lp.topMargin = dp(8);
+        root.addView(bar, lp);
+    }
+
+    private void styleTopPill(Button b) {
+        b.setAllCaps(false);
+        b.setTextColor(Color.WHITE);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setPadding(dp(8), dp(3), dp(8), dp(3));
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xC0000000); // black with alpha
+        bg.setCornerRadius(dp(999));
+        b.setBackground(bg);
+    }
+
+    private int dp(int dp) {
+        return (int) TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP,
+                dp,
+                getResources().getDisplayMetrics());
     }
 
     @Override

@@ -236,6 +236,10 @@ struct UdpNetplay {
 
     bool discoverPeer = false;
 
+    bool requireSecret = false;
+    uint16_t secret16 = 0;
+    uint32_t secret32 = 0;
+
     // Tiny receive buffer keyed by frame % N.
     static constexpr uint32_t kBufN = 256;
     // Delay inputs slightly to absorb jitter (both peers must use same value).
@@ -637,7 +641,7 @@ struct UdpNetplay {
         return false;
     }
 
-    bool start(const char* remoteHost, uint16_t rPort, uint16_t lPort, uint8_t lPlayer, const char* roomServerUrl, const char* roomCode) noexcept {
+    bool start(const char* remoteHost, uint16_t rPort, uint16_t lPort, uint8_t lPlayer, const char* roomServerUrl, const char* roomCode, const char* sharedSecret) noexcept {
         stop();
 
         localPort = (lPort != 0) ? lPort : 7000;
@@ -669,6 +673,12 @@ struct UdpNetplay {
         lastResyncTriggered = {};
 
         discoverPeer = false;
+
+        requireSecret = (sharedSecret && sharedSecret[0]);
+        secret32 = requireSecret ? crc32_(sharedSecret, std::strlen(sharedSecret)) : 0u;
+        uint32_t mix = secret32 ^ (secret32 >> 16);
+        secret16 = static_cast<uint16_t>(mix & 0xFFFFu);
+        if (requireSecret && secret16 == 0) secret16 = 1;
 
         const bool hasRemoteHost = (remoteHost && remoteHost[0]);
         if (!hasRemoteHost) {
@@ -749,6 +759,31 @@ struct UdpNetplay {
             }
             if (n < 4) continue;
 
+            const uint32_t magic = read_u32_be_(buf);
+
+            // Host auto-discovery: only accept the first peer if it presents the correct secret token.
+            if (discoverPeer && !hasPeer) {
+                if (magic != kMagicInput) continue;
+                if (n != static_cast<int>(sizeof(Packet))) continue;
+                if (requireSecret) {
+                    const uint16_t tok = read_u16_be_(buf + 10);
+                    if (tok != secret16) continue;
+                }
+            }
+
+            // Validate token on input packets (best-effort). If it doesn't match, ignore.
+            if (magic == kMagicInput && n == static_cast<int>(sizeof(Packet)) && requireSecret) {
+                const uint16_t tok = read_u16_be_(buf + 10);
+                if (tok != secret16) continue;
+            }
+
+            // Validate token on keepalives.
+            if (magic == kMagicKeepAlive && requireSecret) {
+                if (n < 8) continue;
+                const uint32_t tok = read_u32_be_(buf + 4);
+                if (tok != secret32) continue;
+            }
+
             // Learn/refresh peer endpoint from observed packets (NATs may rewrite source ports).
             if (discoverPeer) {
                 if (!hasPeer) {
@@ -769,8 +804,6 @@ struct UdpNetplay {
 
             hasPeer = true;
             lastRecv = std::chrono::steady_clock::now();
-
-            const uint32_t magic = read_u32_be_(buf);
 
             if (magic == kMagicKeepAlive) {
                 // Keepalive: refresh peer/lastRecv only.
@@ -1014,7 +1047,7 @@ struct UdpNetplay {
 
         uint8_t pkt[8] = {};
         write_u32_be_(pkt, kMagicKeepAlive);
-        write_u32_be_(pkt + 4, 0);
+        write_u32_be_(pkt + 4, requireSecret ? secret32 : 0u);
         sendto(sock, pkt, sizeof(pkt), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
     }
 
@@ -1214,7 +1247,7 @@ struct UdpNetplay {
             p.magic_be = htonl(kMagicInput);
             p.frame_be = htonl(f);
             p.mask_be = htons(sentMask[i]);
-            p.reserved_be = 0;
+            p.reserved_be = htons(requireSecret ? secret16 : 0);
             sendto(sock, &p, sizeof(p), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
         }
     }
@@ -1637,7 +1670,7 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_snesonline_NativeBridge_nativeInitialize(JNIEnv* env, jclass /*cls*/, jstring corePath, jstring romPath, jstring statePath, jstring savePath,
                                                  jboolean enableNetplay, jstring remoteHost,
                                                  jint remotePort, jint localPort, jint localPlayerNum,
-                                                 jstring roomServerUrl, jstring roomCode) {
+                                                 jstring roomServerUrl, jstring roomCode, jstring sharedSecret) {
     if (!corePath || !romPath) return JNI_FALSE;
 
     const char* core = env->GetStringUTFChars(corePath, nullptr);
@@ -1665,6 +1698,11 @@ Java_com_snesonline_NativeBridge_nativeInitialize(JNIEnv* env, jclass /*cls*/, j
     const char* room = nullptr;
     if (roomCode) {
         room = env->GetStringUTFChars(roomCode, nullptr);
+    }
+
+    const char* secret = nullptr;
+    if (sharedSecret) {
+        secret = env->GetStringUTFChars(sharedSecret, nullptr);
     }
 
     auto& eng = snesonline::EmulatorEngine::instance();
@@ -1728,7 +1766,7 @@ Java_com_snesonline_NativeBridge_nativeInitialize(JNIEnv* env, jclass /*cls*/, j
 
             auto np = std::make_unique<UdpNetplay>();
             const char* host = (remote && remote[0]) ? remote : "";
-            if (np->start(host, rp, lp, pnum, roomUrl ? roomUrl : "", room ? room : "")) {
+            if (np->start(host, rp, lp, pnum, roomUrl ? roomUrl : "", room ? room : "", secret ? secret : "")) {
                 // Host: stage the same state for the peer to load.
                 if (pnum == 1 && state && state[0]) {
                     std::vector<uint8_t> bytes;
@@ -1774,6 +1812,10 @@ Java_com_snesonline_NativeBridge_nativeInitialize(JNIEnv* env, jclass /*cls*/, j
     }
     if (roomCode && room) {
         env->ReleaseStringUTFChars(roomCode, room);
+    }
+
+    if (sharedSecret && secret) {
+        env->ReleaseStringUTFChars(sharedSecret, secret);
     }
 
     return (ok && netplayOk) ? JNI_TRUE : JNI_FALSE;

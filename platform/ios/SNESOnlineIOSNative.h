@@ -21,7 +21,8 @@ bool snesonline_ios_initialize(const char* corePath,
                               int localPort,
                               int localPlayerNum,
                               const char* roomServerUrl,
-                              const char* roomCode);
+                              const char* roomCode,
+                              const char* sharedSecret);
 
 void snesonline_ios_shutdown(void);
 

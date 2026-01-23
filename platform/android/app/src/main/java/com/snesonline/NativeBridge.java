@@ -20,7 +20,8 @@ public final class NativeBridge {
             int localPort,
             int localPlayerNum,
             String roomServerUrl,
-            String roomCode);
+            String roomCode,
+            String sharedSecret);
     public static native void nativeShutdown();
 
     public static native void nativeStartLoop();

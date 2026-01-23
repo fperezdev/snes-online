@@ -65,6 +65,14 @@
             android:hint="Local UDP port (default 7000)"
             android:inputType="number" />
 
+        <EditText
+            android:id="@+id/editSecret"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Secret word (for hosting)"
+            android:inputType="text"
+            android:maxLines="1" />
+
         <Button
             android:id="@+id/btnStartConnection"
             android:layout_width="match_parent"
@@ -84,7 +92,7 @@
             android:id="@+id/editConnectionCode"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Connection code (paste from host)"
+            android:hint="Connection string (ip:port:secret)"
             android:inputType="textMultiLine"
             android:maxLines="4"
             android:visibility="gone" />
@@ -116,7 +124,7 @@
                 android:layout_height="40dp"
                 android:layout_marginStart="6dp"
                 android:background="@android:color/transparent"
-                android:contentDescription="Copy connection code"
+                android:contentDescription="Copy connection string"
                 android:src="@drawable/ic_copy" />
 
         </LinearLayout>

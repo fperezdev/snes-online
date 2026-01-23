@@ -13,7 +13,8 @@ final class NativeBridgeIOS {
                            localPort: Int,
                            localPlayerNum: Int,
                            roomServerUrl: String,
-                           roomCode: String) -> Bool {
+                           roomCode: String,
+                           sharedSecret: String) -> Bool {
         return corePath.withCString { coreC in
             return romPath.withCString { romC in
                 return statePath.withCString { stateC in
@@ -21,17 +22,20 @@ final class NativeBridgeIOS {
                         return remoteHost.withCString { hostC in
                             return roomServerUrl.withCString { roomUrlC in
                                 return roomCode.withCString { roomCodeC in
-                                    snesonline_ios_initialize(coreC,
-                                                             romC,
-                                                             stateC,
-                                                             saveC,
-                                                             enableNetplay,
-                                                             hostC,
-                                                             Int32(remotePort),
-                                                             Int32(localPort),
-                                                             Int32(localPlayerNum),
-                                                             roomUrlC,
-                                                             roomCodeC)
+                                    return sharedSecret.withCString { secretC in
+                                        snesonline_ios_initialize(coreC,
+                                                                 romC,
+                                                                 stateC,
+                                                                 saveC,
+                                                                 enableNetplay,
+                                                                 hostC,
+                                                                 Int32(remotePort),
+                                                                 Int32(localPort),
+                                                                 Int32(localPlayerNum),
+                                                                 roomUrlC,
+                                                                 roomCodeC,
+                                                                 secretC)
+                                    }
                                 }
                             }
                         }

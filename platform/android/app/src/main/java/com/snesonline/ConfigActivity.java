@@ -10,7 +10,6 @@ import android.content.res.ColorStateList;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
-import android.util.Base64;
 import android.view.View;
 import android.widget.Toast;
 import android.widget.Switch;
@@ -33,7 +32,6 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.net.NetworkInterface;
 import java.util.Enumeration;
-import java.security.MessageDigest;
 
 public class ConfigActivity extends Activity {
     private static final int REQ_PICK_ROM = 1002;
@@ -50,6 +48,11 @@ public class ConfigActivity extends Activity {
     private static final String PREF_REMOTE_HOST = "remoteHost";
     private static final String PREF_REMOTE_PORT = "remotePort";
 
+    // New format: ip:port:secret
+    private static final String PREF_CONNECTION_STRING = "connectionString";
+    private static final String PREF_SHARED_SECRET = "sharedSecret";
+
+    // Back-compat (older builds stored the base64 connection code here).
     private static final String PREF_CONNECTION_CODE = "connectionCode";
 
     // Default bundled/downloadable core (arm64-v8a)
@@ -62,6 +65,7 @@ public class ConfigActivity extends Activity {
     private Switch switchShowSaveButton;
     private View configRoot;
     private EditText editLocalPort;
+    private EditText editSecret;
     private EditText editConnectionCode;
     private TextView txtStatus;
     private Button btnStart;
@@ -92,7 +96,8 @@ public class ConfigActivity extends Activity {
     private String resolvedRemoteHost = "";
     private int resolvedRemotePort = 0;
 
-    private String connectionCode = "";
+    private String connectionString = "";
+    private String sharedSecret = "";
 
     private enum ConnectionUiState {
         IDLE,
@@ -103,14 +108,7 @@ public class ConfigActivity extends Activity {
 
     private ConnectionUiState connectionUiState = ConnectionUiState.IDLE;
 
-    private String lastHostPublicEndpoint = ""; // ip:port (public mapped)
-
-    private static final class ConnInfo {
-        String publicIp = "";
-        int publicPort = 0;
-        String lanIp = "";
-        int lanPort = 0;
-    }
+    private String lastHostConnectionString = ""; // ip:port:secret
 
     private static final class HostPort {
         String host = "";
@@ -149,108 +147,47 @@ public class ConfigActivity extends Activity {
         }
     }
 
-    private static String encodeConnectionCode(String publicIp, int publicPort, String lanIp, int lanPort) {
-        // v=2 includes a signature so small changes (like port) noticeably change the code.
-        String p = "v=2";
-        if (publicIp != null && !publicIp.isEmpty() && publicPort > 0) {
-            String host = publicIp;
-            // Canonicalize IPv6 endpoints to bracket form.
-            if (host.contains(":") && !host.startsWith("[")) host = "[" + host + "]";
-            p += "&pub=" + host + ":" + publicPort;
-        }
-        if (lanIp != null && !lanIp.isEmpty() && lanPort > 0) {
-            p += "&lan=" + lanIp + ":" + lanPort;
-        }
-
-        String sig = shortSigB64Url(p);
-        if (!sig.isEmpty()) p += "&sig=" + sig;
-
-        byte[] data = p.getBytes(StandardCharsets.UTF_8);
-        String b64 = Base64.encodeToString(data, Base64.URL_SAFE | Base64.NO_WRAP);
-        while (b64.endsWith("=")) b64 = b64.substring(0, b64.length() - 1);
-        return "SNO2:" + b64;
+    private static final class ParsedConnectionString {
+        String host = "";
+        int port = 0;
+        String secret = "";
     }
 
-    private static String shortSigB64Url(String payload) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] h = md.digest(payload.getBytes(StandardCharsets.UTF_8));
-            // 12 bytes => 16 chars base64url-ish (without padding), enough to visibly change.
-            int n = Math.min(12, h.length);
-            byte[] shortHash = new byte[n];
-            System.arraycopy(h, 0, shortHash, 0, n);
-            String b64 = Base64.encodeToString(shortHash, Base64.URL_SAFE | Base64.NO_WRAP);
-            while (b64.endsWith("=")) b64 = b64.substring(0, b64.length() - 1);
-            return b64;
-        } catch (Exception ignored) {
-            return "";
-        }
-    }
+    private static ParsedConnectionString parseConnectionString(String s) throws Exception {
+        if (s == null) throw new Exception("Empty connection string");
+        String t = s.trim();
+        if (t.isEmpty()) throw new Exception("Empty connection string");
 
-    private static ConnInfo decodeConnectionCode(String code) throws Exception {
-        if (code == null) throw new Exception("Empty code");
-        String t = code.trim();
-        String prefix;
-        if (t.startsWith("SNO2:")) prefix = "SNO2:";
-        else if (t.startsWith("SNO1:")) prefix = "SNO1:";
-        else throw new Exception("Invalid code (missing SNO prefix)");
+        int lastColon = t.lastIndexOf(':');
+        if (lastColon <= 0 || lastColon + 1 >= t.length()) throw new Exception("Expected ip:port:secret");
 
-        String b64 = t.substring(prefix.length()).trim();
-        if (b64.isEmpty()) throw new Exception("Invalid code");
-        // Restore padding.
-        int mod = b64.length() % 4;
-        if (mod == 2) b64 += "==";
-        else if (mod == 3) b64 += "=";
-        else if (mod != 0) throw new Exception("Invalid code length");
+        String secret = t.substring(lastColon + 1).trim();
+        String hostPort = t.substring(0, lastColon).trim();
+        if (secret.isEmpty()) throw new Exception("Secret is required");
+        if (secret.contains(":")) throw new Exception("Secret cannot contain ':'");
 
-        byte[] data = Base64.decode(b64, Base64.URL_SAFE);
-        String payload = new String(data, StandardCharsets.UTF_8);
-        ConnInfo out = new ConnInfo();
-        String[] parts = payload.split("&");
-        for (String part : parts) {
-            int eq = part.indexOf('=');
-            if (eq <= 0) continue;
-            String k = part.substring(0, eq);
-            String v = part.substring(eq + 1);
-            if (k.equals("pub")) {
-                HostPort hp = parseHostPort(v);
-                out.publicIp = hp.host;
-                out.publicPort = hp.port;
-            } else if (k.equals("lan")) {
-                String[] hp = v.split(":");
-                if (hp.length == 2) {
-                    out.lanIp = hp[0];
-                    out.lanPort = parseIntOr(hp[1], 0);
-                }
-            }
-        }
-        if (out.publicIp == null) out.publicIp = "";
-        if (out.lanIp == null) out.lanIp = "";
-        if (out.publicIp.isEmpty() || out.publicPort < 1 || out.publicPort > 65535) {
-            throw new Exception("Code is missing a valid public endpoint");
-        }
-        if (!out.lanIp.isEmpty() && (out.lanPort < 1 || out.lanPort > 65535)) {
-            // If LAN IP exists but port doesn't, ignore LAN hint.
-            out.lanIp = "";
-            out.lanPort = 0;
-        }
+        HostPort hp = parseHostPort(hostPort);
+        if (hp.host == null) hp.host = "";
+        if (hp.host.isEmpty() || hp.port < 1 || hp.port > 65535) throw new Exception("Invalid host/port");
+
+        ParsedConnectionString out = new ParsedConnectionString();
+        out.host = hp.host;
+        out.port = hp.port;
+        out.secret = secret;
         return out;
+    }
+
+    private static String canonicalizeHostPortForShare(String host, int port) {
+        if (host == null) host = "";
+        String h = host.trim();
+        if (h.contains(":") && !h.startsWith("[")) h = "[" + h + "]";
+        return h + ":" + port;
     }
 
     private static void copyToClipboard(Activity a, String label, String text) {
         ClipboardManager cm = (ClipboardManager) a.getSystemService(CLIPBOARD_SERVICE);
         if (cm == null) return;
         cm.setPrimaryClip(ClipData.newPlainText(label, text));
-    }
-
-    private static String makeInviteLink(String code) {
-        if (code == null) code = "";
-        return new Uri.Builder()
-                .scheme("snesonline")
-                .authority("join")
-                .appendQueryParameter("code", code)
-                .build()
-                .toString();
     }
 
     private void toastCopied() {
@@ -304,6 +241,7 @@ public class ConfigActivity extends Activity {
         switchOnscreenControls = findViewById(R.id.switchOnscreenControls);
         switchShowSaveButton = findViewById(R.id.switchShowSaveButton);
         editLocalPort = findViewById(R.id.editLocalPort);
+        editSecret = findViewById(R.id.editSecret);
         editConnectionCode = findViewById(R.id.editConnectionCode);
         txtStatus = findViewById(R.id.txtStatus);
 
@@ -333,7 +271,12 @@ public class ConfigActivity extends Activity {
         resolvedRemoteHost = prefs.getString(PREF_REMOTE_HOST, "");
         resolvedRemotePort = prefs.getInt(PREF_REMOTE_PORT, 0);
 
-        connectionCode = prefs.getString(PREF_CONNECTION_CODE, "");
+        sharedSecret = prefs.getString(PREF_SHARED_SECRET, "");
+        connectionString = prefs.getString(PREF_CONNECTION_STRING, "");
+        if (connectionString == null || connectionString.isEmpty()) {
+            // Back-compat: older builds stored connection codes here.
+            connectionString = prefs.getString(PREF_CONNECTION_CODE, "");
+        }
 
         switchNetplay.setChecked(netplayEnabled);
         switchOnscreenControls.setChecked(showOnscreenControls);
@@ -343,7 +286,11 @@ public class ConfigActivity extends Activity {
 
         editLocalPort.setText(String.valueOf(localPort));
 
-        if (connectionCode != null && !connectionCode.isEmpty()) editConnectionCode.setText(connectionCode);
+        if (editSecret != null && sharedSecret != null && !sharedSecret.isEmpty()) {
+            editSecret.setText(sharedSecret);
+        }
+
+        if (connectionString != null && !connectionString.isEmpty()) editConnectionCode.setText(connectionString);
 
         if (btnPickRom != null) btnPickRom.setOnClickListener(v -> pickFile(REQ_PICK_ROM));
 
@@ -359,6 +306,13 @@ public class ConfigActivity extends Activity {
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
             @Override public void afterTextChanged(Editable s) { updateStartButtonEnabled(); }
         });
+        if (editSecret != null) {
+            editSecret.addTextChangedListener(new TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+                @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+                @Override public void afterTextChanged(Editable s) { updateStartButtonEnabled(); }
+            });
+        }
 
         switchNetplay.setOnCheckedChangeListener((buttonView, isChecked) -> updateNetplayUi(isChecked));
         updateNetplayUi(netplayEnabled);
@@ -444,8 +398,14 @@ public class ConfigActivity extends Activity {
             // Netplay still starts when Start Game is pressed, but the UI must be "ready" first.
             final int role = prefs.getInt(PREF_NETPLAY_ROLE, netplayRole);
             if (role == 1) {
-                if (connectionUiState != ConnectionUiState.HOST_READY || connectionCode == null || connectionCode.trim().isEmpty()) {
+                if (connectionUiState != ConnectionUiState.HOST_READY || connectionString == null || connectionString.trim().isEmpty()) {
                     setStatus("Press Start connection first");
+                    return;
+                }
+
+                String secret = (editSecret != null) ? editSecret.getText().toString().trim() : "";
+                if (secret.isEmpty()) {
+                    setStatus("Set a secret word");
                     return;
                 }
 
@@ -461,6 +421,7 @@ public class ConfigActivity extends Activity {
                 i.putExtra("remoteHost", "");
                 i.putExtra("remotePort", 0);
                 i.putExtra("localPlayerNum", 1);
+                i.putExtra("sharedSecret", secret);
                 i.putExtra("roomServerUrl", "");
                 i.putExtra("roomCode", "");
                 i.putExtra("roomPassword", "");
@@ -476,8 +437,15 @@ public class ConfigActivity extends Activity {
 
             String savedHost = prefs.getString(PREF_REMOTE_HOST, "");
             int savedPort = prefs.getInt(PREF_REMOTE_PORT, 0);
+            String savedSecret = prefs.getString(PREF_SHARED_SECRET, "");
             if (savedHost == null || savedHost.isEmpty() || savedPort < 1 || savedPort > 65535) {
                 setStatus("Join endpoint missing. Press Join connection again.");
+                applyConnectionUiState(ConnectionUiState.JOIN_INPUT);
+                updateStartButtonEnabled();
+                return;
+            }
+            if (savedSecret == null || savedSecret.trim().isEmpty()) {
+                setStatus("Secret missing. Press Join connection again.");
                 applyConnectionUiState(ConnectionUiState.JOIN_INPUT);
                 updateStartButtonEnabled();
                 return;
@@ -496,6 +464,7 @@ public class ConfigActivity extends Activity {
             i.putExtra("remoteHost", savedHost);
             i.putExtra("remotePort", savedPort);
             i.putExtra("localPlayerNum", 2);
+            i.putExtra("sharedSecret", savedSecret);
             i.putExtra("roomServerUrl", "");
             i.putExtra("roomCode", "");
             i.putExtra("roomPassword", "");
@@ -507,6 +476,16 @@ public class ConfigActivity extends Activity {
             localPort = parseIntOr(editLocalPort.getText().toString().trim(), 7000);
             if (!isValidPort(localPort)) {
                 setStatus("Host: local UDP port must be 1..65535");
+                return;
+            }
+
+            String secret = (editSecret != null) ? editSecret.getText().toString().trim() : "";
+            if (secret.isEmpty()) {
+                setStatus("Host: secret word is required");
+                return;
+            }
+            if (secret.contains(":")) {
+                setStatus("Host: secret cannot contain ':'");
                 return;
             }
 
@@ -522,24 +501,26 @@ public class ConfigActivity extends Activity {
                     int pubPort = hp.port;
                     if (pubIp.isEmpty() || pubPort < 1 || pubPort > 65535) throw new Exception("STUN returned invalid port");
 
-                    String lanIp = localLanIpv4BestEffort();
-                    String code = encodeConnectionCode(pubIp, pubPort, lanIp, localPort);
-                    connectionCode = code;
-                    lastHostPublicEndpoint = pubIp + ":" + pubPort;
+                    String hostPort = canonicalizeHostPortForShare(pubIp, pubPort);
+                    String conn = hostPort + ":" + secret;
+                    connectionString = conn;
+                    sharedSecret = secret;
+                    lastHostConnectionString = conn;
 
                     prefs.edit()
                             .putBoolean(PREF_NETPLAY_ENABLED, true)
                             .putBoolean(PREF_SHOW_ONSCREEN_CONTROLS, showOnscreenControls)
                             .putInt(PREF_LOCAL_PORT, localPort)
-                            .putString(PREF_CONNECTION_CODE, connectionCode)
+                            .putString(PREF_CONNECTION_STRING, connectionString)
+                            .putString(PREF_SHARED_SECRET, sharedSecret)
                             .putInt(PREF_NETPLAY_ROLE, 1)
                             .putString(PREF_REMOTE_HOST, "")
                             .putInt(PREF_REMOTE_PORT, 0)
                             .apply();
 
                     runOnUiThread(() -> {
-                        editConnectionCode.setText(connectionCode);
-                        copyToClipboard(this, "Invite link", makeInviteLink(connectionCode));
+                        editConnectionCode.setText(connectionString);
+                        copyToClipboard(this, "Connection string", connectionString);
                         toastCopied();
                         netplayRole = 1;
                         switchNetplay.setChecked(true);
@@ -558,31 +539,35 @@ public class ConfigActivity extends Activity {
                 // First press enters Join mode.
                 netplayRole = 2;
                 applyConnectionUiState(ConnectionUiState.JOIN_INPUT);
-                setStatus("Paste the code");
+                setStatus("Paste the connection string");
                 updateStartButtonEnabled();
                 return;
             }
 
             showOnscreenControls = switchOnscreenControls.isChecked();
             localPort = parseIntOr(editLocalPort.getText().toString().trim(), 7000);
-            connectionCode = editConnectionCode.getText().toString().trim();
+            connectionString = editConnectionCode.getText().toString().trim();
             if (!isValidPort(localPort)) {
                 setStatus("Join: local UDP port must be 1..65535");
                 return;
             }
-            if (connectionCode.isEmpty()) {
-                setStatus("Paste the connection code from Player 1");
+            if (connectionString.isEmpty()) {
+                setStatus("Paste the connection string from Player 1");
                 return;
             }
 
-            setStatus("Parsing code...");
+            setStatus("Parsing connection string...");
             new Thread(() -> {
                 try {
-                    ConnInfo info = decodeConnectionCode(connectionCode);
+                    ParsedConnectionString info = parseConnectionString(connectionString);
+
+                    // Join: the secret comes from the connection string.
+                    // If the user typed something in the secret field, we overwrite it to match.
+                    sharedSecret = info.secret;
 
                     // Keep endpoints consistent across devices: always use the public endpoint from the code.
-                    final String finalHost = info.publicIp;
-                    final int finalPort = info.publicPort;
+                    final String finalHost = info.host;
+                    final int finalPort = info.port;
                     if (finalHost == null || finalHost.isEmpty() || finalPort < 1 || finalPort > 65535) {
                         throw new Exception("Invalid host endpoint");
                     }
@@ -591,7 +576,8 @@ public class ConfigActivity extends Activity {
                             .putBoolean(PREF_NETPLAY_ENABLED, true)
                             .putBoolean(PREF_SHOW_ONSCREEN_CONTROLS, showOnscreenControls)
                             .putInt(PREF_LOCAL_PORT, localPort)
-                            .putString(PREF_CONNECTION_CODE, connectionCode)
+                            .putString(PREF_CONNECTION_STRING, connectionString)
+                            .putString(PREF_SHARED_SECRET, sharedSecret)
                             .putInt(PREF_NETPLAY_ROLE, 2)
                             .putString(PREF_REMOTE_HOST, finalHost)
                             .putInt(PREF_REMOTE_PORT, finalPort)
@@ -601,6 +587,7 @@ public class ConfigActivity extends Activity {
                         netplayRole = 2;
                         resolvedRemoteHost = finalHost;
                         resolvedRemotePort = finalPort;
+                        if (editSecret != null) editSecret.setText(sharedSecret);
                         switchNetplay.setChecked(true);
                         applyConnectionUiState(ConnectionUiState.JOIN_READY);
                         setStatus("");
@@ -618,86 +605,31 @@ public class ConfigActivity extends Activity {
 
         if (btnCopyConnectionIcon != null) {
             btnCopyConnectionIcon.setOnClickListener(v -> {
-                if (connectionCode == null || connectionCode.trim().isEmpty()) return;
-                copyToClipboard(this, "Invite link", makeInviteLink(connectionCode));
+                if (connectionString == null || connectionString.trim().isEmpty()) return;
+                copyToClipboard(this, "Connection string", connectionString);
                 toastCopied();
             });
         }
 
         btnCancelConnection.setOnClickListener(v -> {
             prefs.edit()
+                    .putString(PREF_CONNECTION_STRING, "")
+                    .putString(PREF_SHARED_SECRET, "")
                     .putString(PREF_CONNECTION_CODE, "")
                     .putInt(PREF_NETPLAY_ROLE, 1)
                     .putString(PREF_REMOTE_HOST, "")
                     .putInt(PREF_REMOTE_PORT, 0)
                     .apply();
-            connectionCode = "";
+            connectionString = "";
+            sharedSecret = "";
             resolvedRemoteHost = "";
             resolvedRemotePort = 0;
-            lastHostPublicEndpoint = "";
+            lastHostConnectionString = "";
             editConnectionCode.setText("");
             applyConnectionUiState(ConnectionUiState.IDLE);
             setStatus("");
             updateStartButtonEnabled();
         });
-
-        // Handle snesonline://join?code=... deep links.
-        handleInviteIntent(getIntent());
-    }
-
-    @Override
-    protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        setIntent(intent);
-        handleInviteIntent(intent);
-    }
-
-    private void handleInviteIntent(Intent intent) {
-        if (intent == null) return;
-        Uri data = intent.getData();
-        if (data == null) return;
-        if (!"snesonline".equalsIgnoreCase(data.getScheme())) return;
-        if (!"join".equalsIgnoreCase(data.getHost())) return;
-        String code = data.getQueryParameter("code");
-        if (code == null) code = "";
-        code = code.trim();
-        if (code.isEmpty()) return;
-
-        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-
-        // Best-effort: ensure netplay is enabled and we are in join flow.
-        netplayEnabled = true;
-        netplayRole = 2;
-        if (switchNetplay != null) switchNetplay.setChecked(true);
-
-        if (editConnectionCode != null) editConnectionCode.setText(code);
-        connectionCode = code;
-
-        localPort = parseIntOr(editLocalPort.getText().toString().trim(), 7000);
-        if (!isValidPort(localPort)) localPort = 7000;
-
-        try {
-            ConnInfo info = decodeConnectionCode(code);
-            resolvedRemoteHost = info.publicIp;
-            resolvedRemotePort = info.publicPort;
-
-            prefs.edit()
-                    .putBoolean(PREF_NETPLAY_ENABLED, true)
-                    .putInt(PREF_LOCAL_PORT, localPort)
-                    .putString(PREF_CONNECTION_CODE, connectionCode)
-                    .putInt(PREF_NETPLAY_ROLE, 2)
-                    .putString(PREF_REMOTE_HOST, resolvedRemoteHost)
-                    .putInt(PREF_REMOTE_PORT, resolvedRemotePort)
-                    .apply();
-
-            applyConnectionUiState(ConnectionUiState.JOIN_READY);
-            setStatus("");
-        } catch (Exception e) {
-            applyConnectionUiState(ConnectionUiState.JOIN_INPUT);
-            setStatus("Invalid invite link: " + e.getMessage());
-        }
-
-        updateStartButtonEnabled();
     }
 
     private void applyConfigTheme() {
@@ -823,6 +755,9 @@ public class ConfigActivity extends Activity {
         if (switchNetplay != null && switchNetplay.isChecked()) {
             // Config is considered "established" when it's ready to start the game with netplay parameters.
             enabled = enabled && (connectionUiState == ConnectionUiState.HOST_READY || connectionUiState == ConnectionUiState.JOIN_READY);
+
+            String secret = (editSecret != null) ? editSecret.getText().toString().trim() : "";
+            enabled = enabled && secret != null && !secret.isEmpty();
         }
 
         if (btnStart != null) btnStart.setEnabled(enabled);
@@ -851,14 +786,14 @@ public class ConfigActivity extends Activity {
             editConnectionCode.setEnabled(st != ConnectionUiState.JOIN_READY);
         }
 
-        boolean showHostWaiting = (st == ConnectionUiState.HOST_READY && lastHostPublicEndpoint != null && !lastHostPublicEndpoint.isEmpty());
+        boolean showHostWaiting = (st == ConnectionUiState.HOST_READY && lastHostConnectionString != null && !lastHostConnectionString.isEmpty());
         if (hostWaitingRow != null) hostWaitingRow.setVisibility(showHostWaiting ? View.VISIBLE : View.GONE);
-        if (txtHostWaiting != null) txtHostWaiting.setText(showHostWaiting ? ("The other player should connect at " + lastHostPublicEndpoint) : "");
+        if (txtHostWaiting != null) txtHostWaiting.setText(showHostWaiting ? ("Share: " + lastHostConnectionString) : "");
         if (btnCopyConnectionIcon != null) btnCopyConnectionIcon.setVisibility(showHostWaiting ? View.VISIBLE : View.GONE);
 
         if (txtJoinTarget != null) {
             if (st == ConnectionUiState.JOIN_READY && resolvedRemoteHost != null && !resolvedRemoteHost.isEmpty() && resolvedRemotePort > 0) {
-                txtJoinTarget.setText("Will connect to " + resolvedRemoteHost + ":" + resolvedRemotePort);
+                txtJoinTarget.setText("Will connect to " + resolvedRemoteHost + ":" + resolvedRemotePort + " (secret set)");
                 txtJoinTarget.setVisibility(View.VISIBLE);
             } else {
                 txtJoinTarget.setVisibility(View.GONE);
