@@ -71,6 +71,12 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         title = "SNES ONLINE"
         view.backgroundColor = UiStyle.configBackground
 
+        // UX: allow dismissing the keyboard by tapping outside inputs, and also by dragging the scroll view.
+        scroll.keyboardDismissMode = .onDrag
+        let tapToDismiss = UITapGestureRecognizer(target: self, action: #selector(backgroundTappedToDismissKeyboard))
+        tapToDismiss.cancelsTouchesInView = false
+        view.addGestureRecognizer(tapToDismiss)
+
         stack.axis = .vertical
         stack.spacing = 12
         stack.alignment = .fill
@@ -132,14 +138,17 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         localPortField.borderStyle = .roundedRect
         localPortField.placeholder = "Local UDP port (default 7000)"
         localPortField.keyboardType = .numberPad
+        localPortField.delegate = self
         localPortField.textColor = UiStyle.configText
         stack.addArrangedSubview(localPortField)
 
         secretField.borderStyle = .roundedRect
-        secretField.placeholder = "Secret word (required)"
+        secretField.placeholder = "Secret word (for hosting)"
         secretField.keyboardType = .default
         secretField.autocapitalizationType = .none
         secretField.autocorrectionType = .no
+        secretField.returnKeyType = .done
+        secretField.delegate = self
         secretField.textColor = UiStyle.configText
         stack.addArrangedSubview(secretField)
 
@@ -211,6 +220,15 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         applyConnectionUiState(.idle)
         updateStartButtonEnabled()
         setStatus("")
+    }
+
+    @objc private func backgroundTappedToDismissKeyboard() {
+        view.endEditing(true)
+    }
+
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        textField.resignFirstResponder()
+        return true
     }
 
     override func viewWillAppear(_ animated: Bool) {

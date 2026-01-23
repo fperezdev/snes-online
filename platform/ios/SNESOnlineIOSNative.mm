@@ -819,15 +819,17 @@ struct UdpNetplay {
         if (!wantStateSync || stateTx.empty() || stateChunkCount == 0) return;
         if (peerStateReady) return;
 
+        // Android wire format (for cross-platform):
+        // - StateInfo: 16 bytes: magic, size, crc, chunkSize, chunkCount
+        // - StateChunk: 12 + payload: magic, idx, chunkCount, payloadSize, reserved, payload
         const auto now = std::chrono::steady_clock::now();
         if (lastInfoSent.time_since_epoch().count() == 0 || (now - lastInfoSent) > std::chrono::milliseconds(500)) {
-            uint8_t info[24] = {};
+            uint8_t info[16] = {};
             write_u32_be_(info, kMagicStateInfo);
             write_u32_be_(info + 4, stateSize);
             write_u32_be_(info + 8, stateCrc);
             write_u16_be_(info + 12, stateChunkSize);
             write_u16_be_(info + 14, stateChunkCount);
-            write_u32_be_(info + 16, frame);
             sendto(sock, info, sizeof(info), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
             lastInfoSent = now;
         }
@@ -836,14 +838,17 @@ struct UdpNetplay {
             const uint16_t chunk = static_cast<uint16_t>(nextChunkToSend % stateChunkCount);
             const uint32_t off = static_cast<uint32_t>(chunk) * static_cast<uint32_t>(stateChunkSize);
             if (off >= stateSize) break;
-            const uint32_t n = std::min<uint32_t>(stateChunkSize, stateSize - off);
+            const uint32_t payloadN = std::min<uint32_t>(stateChunkSize, stateSize - off);
+            const uint16_t payloadSz = static_cast<uint16_t>(payloadN);
 
             std::vector<uint8_t> pkt;
-            pkt.resize(8 + 2 + n);
+            pkt.resize(12u + payloadN);
             write_u32_be_(pkt.data(), kMagicStateChunk);
-            write_u32_be_(pkt.data() + 4, stateCrc);
-            write_u16_be_(pkt.data() + 8, chunk);
-            std::memcpy(pkt.data() + 10, stateTx.data() + off, n);
+            write_u16_be_(pkt.data() + 4, chunk);
+            write_u16_be_(pkt.data() + 6, stateChunkCount);
+            write_u16_be_(pkt.data() + 8, payloadSz);
+            write_u16_be_(pkt.data() + 10, 0);
+            std::memcpy(pkt.data() + 12, stateTx.data() + off, payloadN);
             sendto(sock, pkt.data(), pkt.size(), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
             nextChunkToSend = static_cast<uint16_t>(nextChunkToSend + 1);
         }
@@ -854,15 +859,19 @@ struct UdpNetplay {
         if (!wantSaveRamSync || saveRamTx.empty() || saveRamChunkCount == 0) return;
         if (peerSaveRamReady) return;
 
+        // Android wire format (for cross-platform):
+        // - SaveRamInfo: 16 bytes (+ optional 2 byte flags): magic, size, crc, chunkSize, chunkCount, [flags]
+        // - SaveRamChunk: 12 + payload: magic, idx, chunkCount, payloadSize, reserved, payload
         const auto now = std::chrono::steady_clock::now();
         if (lastSaveRamInfoSent.time_since_epoch().count() == 0 || (now - lastSaveRamInfoSent) > std::chrono::milliseconds(500)) {
-            uint8_t info[20] = {};
+            uint8_t info[18] = {};
             write_u32_be_(info, kMagicSaveRamInfo);
             write_u32_be_(info + 4, saveRamSize);
             write_u32_be_(info + 8, saveRamCrc);
             write_u16_be_(info + 12, saveRamChunkSize);
             write_u16_be_(info + 14, saveRamChunkCount);
-            write_u32_be_(info + 16, frame);
+            const uint16_t flags = saveRamGate ? 1u : 0u;
+            write_u16_be_(info + 16, flags);
             sendto(sock, info, sizeof(info), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
             lastSaveRamInfoSent = now;
         }
@@ -871,14 +880,17 @@ struct UdpNetplay {
             const uint16_t chunk = static_cast<uint16_t>(nextSaveRamChunkToSend % saveRamChunkCount);
             const uint32_t off = static_cast<uint32_t>(chunk) * static_cast<uint32_t>(saveRamChunkSize);
             if (off >= saveRamSize) break;
-            const uint32_t n = std::min<uint32_t>(saveRamChunkSize, saveRamSize - off);
+            const uint32_t payloadN = std::min<uint32_t>(saveRamChunkSize, saveRamSize - off);
+            const uint16_t payloadSz = static_cast<uint16_t>(payloadN);
 
             std::vector<uint8_t> pkt;
-            pkt.resize(8 + 2 + n);
+            pkt.resize(12u + payloadN);
             write_u32_be_(pkt.data(), kMagicSaveRamChunk);
-            write_u32_be_(pkt.data() + 4, saveRamCrc);
-            write_u16_be_(pkt.data() + 8, chunk);
-            std::memcpy(pkt.data() + 10, saveRamTx.data() + off, n);
+            write_u16_be_(pkt.data() + 4, chunk);
+            write_u16_be_(pkt.data() + 6, saveRamChunkCount);
+            write_u16_be_(pkt.data() + 8, payloadSz);
+            write_u16_be_(pkt.data() + 10, 0);
+            std::memcpy(pkt.data() + 12, saveRamTx.data() + off, payloadN);
             sendto(sock, pkt.data(), pkt.size(), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
             nextSaveRamChunkToSend = static_cast<uint16_t>(nextSaveRamChunkToSend + 1);
         }
@@ -974,13 +986,14 @@ struct UdpNetplay {
             }
 
             if (magic == kMagicStateInfo) {
-                if (n < 20) continue;
+                // Accept both iOS legacy (>=20) and Android (>=16) formats.
+                if (n < 16) continue;
                 if (localPlayerNum != 2) continue;
                 const uint32_t size = read_u32_be_(buf + 4);
                 const uint32_t crc = read_u32_be_(buf + 8);
                 const uint16_t chunkSize = read_u16_be_(buf + 12);
                 const uint16_t chunkCount = read_u16_be_(buf + 14);
-                (void)read_u32_be_(buf + 16);
+                // iOS legacy includes frame at +16; ignore.
 
                 if (size == 0 || chunkSize == 0 || chunkCount == 0) continue;
                 stateSize = size;
@@ -997,20 +1010,46 @@ struct UdpNetplay {
             }
 
             if (magic == kMagicStateChunk) {
-                if (n < 10) continue;
                 if (localPlayerNum != 2) continue;
-                const uint32_t crc = read_u32_be_(buf + 4);
-                const uint16_t chunk = read_u16_be_(buf + 8);
-                if (crc != stateCrc || stateChunkCount == 0 || chunk >= stateChunkCount) continue;
-
+                if (stateChunkCount == 0) continue;
                 if (stateRxHave.empty() || stateRx.empty()) continue;
+
+                uint16_t chunk = 0;
+                const uint8_t* payload = nullptr;
+                uint32_t payloadN = 0;
+
+                if (n >= 12) {
+                    // Android format: magic, idx, chunkCount, payloadSize, reserved, payload
+                    const uint16_t idx = read_u16_be_(buf + 4);
+                    const uint16_t ccnt = read_u16_be_(buf + 6);
+                    const uint16_t psz = read_u16_be_(buf + 8);
+                    if (ccnt != stateChunkCount) continue;
+                    if (idx >= stateChunkCount) continue;
+                    if (psz == 0) continue;
+                    if (12u + static_cast<uint32_t>(psz) > static_cast<uint32_t>(n)) continue;
+                    chunk = idx;
+                    payload = buf + 12;
+                    payloadN = psz;
+                } else if (n >= 10) {
+                    // Legacy iOS format: magic, crc, chunk, payload
+                    const uint32_t crc = read_u32_be_(buf + 4);
+                    const uint16_t idx = read_u16_be_(buf + 8);
+                    if (crc != stateCrc) continue;
+                    if (idx >= stateChunkCount) continue;
+                    chunk = idx;
+                    payload = buf + 10;
+                    payloadN = static_cast<uint32_t>(n) - 10u;
+                } else {
+                    continue;
+                }
+
                 if (stateRxHave[chunk]) continue;
 
                 const uint32_t off = static_cast<uint32_t>(chunk) * static_cast<uint32_t>(stateChunkSize);
                 if (off >= stateSize) continue;
-                const uint32_t want = std::min<uint32_t>(static_cast<uint32_t>(n) - 10u, stateSize - off);
-                if (want == 0) continue;
-                std::memcpy(stateRx.data() + off, buf + 10, want);
+                const uint32_t copyN = std::min<uint32_t>(payloadN, stateSize - off);
+                if (copyN == 0) continue;
+                std::memcpy(stateRx.data() + off, payload, copyN);
                 stateRxHave[chunk] = 1;
                 stateRxHaveCount++;
 
@@ -1020,9 +1059,11 @@ struct UdpNetplay {
                         (void)loadStateBytes_(stateRx.data(), stateRx.size());
                         selfStateReady = true;
 
-                        uint8_t ack[8] = {};
+                        // Android ack format: magic, size, crc
+                        uint8_t ack[12] = {};
                         write_u32_be_(ack, kMagicStateAck);
-                        write_u32_be_(ack + 4, stateCrc);
+                        write_u32_be_(ack + 4, stateSize);
+                        write_u32_be_(ack + 8, stateCrc);
                         sendto(sock, ack, sizeof(ack), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
                     }
                 }
@@ -1030,29 +1071,36 @@ struct UdpNetplay {
             }
 
             if (magic == kMagicStateAck) {
-                if (n < 8) continue;
                 if (localPlayerNum != 1) continue;
-                const uint32_t crc = read_u32_be_(buf + 4);
-                if (crc == stateCrc) {
-                    peerStateReady = true;
+                // Accept Android (12) and legacy iOS (8) ack formats.
+                if (n >= 12) {
+                    const uint32_t sz = read_u32_be_(buf + 4);
+                    const uint32_t crc = read_u32_be_(buf + 8);
+                    if (sz == stateSize && crc == stateCrc) peerStateReady = true;
+                } else if (n >= 8) {
+                    const uint32_t crc = read_u32_be_(buf + 4);
+                    if (crc == stateCrc) peerStateReady = true;
                 }
                 continue;
             }
 
             if (magic == kMagicSaveRamInfo) {
-                if (n < 20) continue;
+                // Accept both iOS legacy (>=20) and Android (>=16) formats.
+                if (n < 16) continue;
                 if (localPlayerNum != 2) continue;
                 const uint32_t size = read_u32_be_(buf + 4);
                 const uint32_t crc = read_u32_be_(buf + 8);
                 const uint16_t chunkSize = read_u16_be_(buf + 12);
                 const uint16_t chunkCount = read_u16_be_(buf + 14);
-                (void)read_u32_be_(buf + 16);
+                uint16_t flags = 0;
+                if (n >= 18) flags = read_u16_be_(buf + 16);
 
                 if (size == 0 || chunkSize == 0 || chunkCount == 0) continue;
                 saveRamSize = size;
                 saveRamCrc = crc;
                 saveRamChunkSize = chunkSize;
                 saveRamChunkCount = chunkCount;
+                saveRamGate = (flags & 1u) != 0;
 
                 saveRamRx.assign(saveRamSize, 0);
                 saveRamRxHave.assign(saveRamChunkCount, 0);
@@ -1063,20 +1111,46 @@ struct UdpNetplay {
             }
 
             if (magic == kMagicSaveRamChunk) {
-                if (n < 10) continue;
                 if (localPlayerNum != 2) continue;
-                const uint32_t crc = read_u32_be_(buf + 4);
-                const uint16_t chunk = read_u16_be_(buf + 8);
-                if (crc != saveRamCrc || saveRamChunkCount == 0 || chunk >= saveRamChunkCount) continue;
-
+                if (saveRamChunkCount == 0) continue;
                 if (saveRamRxHave.empty() || saveRamRx.empty()) continue;
+
+                uint16_t chunk = 0;
+                const uint8_t* payload = nullptr;
+                uint32_t payloadN = 0;
+
+                if (n >= 12) {
+                    // Android format: magic, idx, chunkCount, payloadSize, reserved, payload
+                    const uint16_t idx = read_u16_be_(buf + 4);
+                    const uint16_t ccnt = read_u16_be_(buf + 6);
+                    const uint16_t psz = read_u16_be_(buf + 8);
+                    if (ccnt != saveRamChunkCount) continue;
+                    if (idx >= saveRamChunkCount) continue;
+                    if (psz == 0) continue;
+                    if (12u + static_cast<uint32_t>(psz) > static_cast<uint32_t>(n)) continue;
+                    chunk = idx;
+                    payload = buf + 12;
+                    payloadN = psz;
+                } else if (n >= 10) {
+                    // Legacy iOS format: magic, crc, chunk, payload
+                    const uint32_t crc = read_u32_be_(buf + 4);
+                    const uint16_t idx = read_u16_be_(buf + 8);
+                    if (crc != saveRamCrc) continue;
+                    if (idx >= saveRamChunkCount) continue;
+                    chunk = idx;
+                    payload = buf + 10;
+                    payloadN = static_cast<uint32_t>(n) - 10u;
+                } else {
+                    continue;
+                }
+
                 if (saveRamRxHave[chunk]) continue;
 
                 const uint32_t off = static_cast<uint32_t>(chunk) * static_cast<uint32_t>(saveRamChunkSize);
                 if (off >= saveRamSize) continue;
-                const uint32_t want = std::min<uint32_t>(static_cast<uint32_t>(n) - 10u, saveRamSize - off);
-                if (want == 0) continue;
-                std::memcpy(saveRamRx.data() + off, buf + 10, want);
+                const uint32_t copyN = std::min<uint32_t>(payloadN, saveRamSize - off);
+                if (copyN == 0) continue;
+                std::memcpy(saveRamRx.data() + off, payload, copyN);
                 saveRamRxHave[chunk] = 1;
                 saveRamRxHaveCount++;
 
@@ -1086,9 +1160,11 @@ struct UdpNetplay {
                         (void)applySaveRamBytes_(saveRamRx.data(), saveRamRx.size());
                         selfSaveRamReady = true;
 
-                        uint8_t ack[8] = {};
+                        // Android ack format: magic, size, crc
+                        uint8_t ack[12] = {};
                         write_u32_be_(ack, kMagicSaveRamAck);
-                        write_u32_be_(ack + 4, saveRamCrc);
+                        write_u32_be_(ack + 4, saveRamSize);
+                        write_u32_be_(ack + 8, saveRamCrc);
                         sendto(sock, ack, sizeof(ack), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
                     }
                 }
@@ -1096,11 +1172,15 @@ struct UdpNetplay {
             }
 
             if (magic == kMagicSaveRamAck) {
-                if (n < 8) continue;
                 if (localPlayerNum != 1) continue;
-                const uint32_t crc = read_u32_be_(buf + 4);
-                if (crc == saveRamCrc) {
-                    peerSaveRamReady = true;
+                // Accept Android (12) and legacy iOS (8) ack formats.
+                if (n >= 12) {
+                    const uint32_t sz = read_u32_be_(buf + 4);
+                    const uint32_t crc = read_u32_be_(buf + 8);
+                    if (sz == saveRamSize && crc == saveRamCrc) peerSaveRamReady = true;
+                } else if (n >= 8) {
+                    const uint32_t crc = read_u32_be_(buf + 4);
+                    if (crc == saveRamCrc) peerSaveRamReady = true;
                 }
                 continue;
             }

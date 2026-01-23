@@ -123,6 +123,9 @@ final class IOSGameViewController: UIViewController {
                 ov.bottomAnchor.constraint(equalTo: view.bottomAnchor)
             ])
             overlay = ov
+
+            // The overlay view is fullscreen and handles touches; ensure the top pills stay tappable.
+            view.bringSubviewToFront(topPills)
         }
 
         setupControllers()
