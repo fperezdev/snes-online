@@ -306,6 +306,7 @@ struct UdpNetplay {
     uint16_t stateChunkSize = 1024;
     uint16_t stateChunkCount = 0;
     std::chrono::steady_clock::time_point lastInfoSent{};
+    std::chrono::steady_clock::time_point stateSyncDeadline{};
     uint16_t nextChunkToSend = 0;
 
     std::vector<uint8_t> stateRx;
@@ -341,6 +342,7 @@ struct UdpNetplay {
         selfStateReady = true;
         nextChunkToSend = 0;
         lastInfoSent = {};
+        stateSyncDeadline = wantStateSync ? (std::chrono::steady_clock::now() + std::chrono::seconds(10)) : std::chrono::steady_clock::time_point{};
     }
 
     void configureStateSyncJoiner() noexcept {
@@ -350,6 +352,7 @@ struct UdpNetplay {
         selfStateReady = true;
         joinAwaitingStateOffer = true;
         joinWaitStateOfferDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        stateSyncDeadline = {};
         stateRx.clear();
         stateRxHave.clear();
         stateRxHaveCount = 0;
@@ -634,6 +637,24 @@ struct UdpNetplay {
         remotePort = (rPort != 0) ? rPort : 7000;
         localPlayerNum = (lPlayer == 2) ? 2 : 1;
 
+        // This is a gameplay role (P1 = host, P2 = joiner), independent of whether state sync is active.
+        isHost = (localPlayerNum == 1);
+
+        // Reset sync gating state; later we may enable state/SRAM sync explicitly.
+        wantStateSync = false;
+        peerStateReady = true;
+        selfStateReady = true;
+        joinAwaitingStateOffer = false;
+        joinWaitStateOfferDeadline = {};
+        stateSyncDeadline = {};
+
+        wantSaveRamSync = false;
+        saveRamGate = false;
+        peerSaveRamReady = true;
+        selfSaveRamReady = true;
+        joinAwaitingSaveRamOffer = false;
+        joinWaitSaveRamOfferDeadline = {};
+
         remoteFrameTag.fill(0xFFFFFFFFu);
         remoteMask.fill(0);
         sentFrameTag.fill(0xFFFFFFFFu);
@@ -721,6 +742,7 @@ struct UdpNetplay {
         // Joiner must wait for a host state offer.
         if (localPlayerNum == 2) {
             configureStateSyncJoiner();
+            configureSaveRamSyncJoiner();
         }
         return true;
     }
@@ -735,8 +757,54 @@ struct UdpNetplay {
         wantSaveRamSync = false;
     }
 
-    bool readyToRun() const noexcept {
-        return selfStateReady && peerStateReady && selfSaveRamReady && peerSaveRamReady;
+    bool readyToRun() noexcept {
+        if (!hasPeer) return false;
+        const auto now = std::chrono::steady_clock::now();
+
+        // Joiner: allow starting even if host never offers a state.
+        if (!isHost && joinAwaitingStateOffer) {
+            if (now < joinWaitStateOfferDeadline) {
+                return false;
+            }
+            joinAwaitingStateOffer = false;
+        }
+
+        // State sync gating (with timeout fallback).
+        if (isHost && wantStateSync) {
+            if (!peerStateReady && stateSyncDeadline.time_since_epoch().count() != 0 && now > stateSyncDeadline) {
+                // Peer never acked (likely couldn't load the state). Fall back to starting from reset.
+                wantStateSync = false;
+                peerStateReady = true;
+                selfStateReady = true;
+                stateTx.clear();
+                stateSize = 0;
+                stateCrc = 0;
+                stateChunkCount = 0;
+                stateSyncDeadline = {};
+            }
+            return peerStateReady;
+        }
+        if (!isHost && wantStateSync) {
+            if (!selfStateReady && stateSyncDeadline.time_since_epoch().count() != 0 && now > stateSyncDeadline) {
+                // We received a state offer but couldn't successfully load it. Fall back to starting from reset.
+                wantStateSync = false;
+                selfStateReady = true;
+                peerStateReady = true;
+                stateRx.clear();
+                stateRxHave.clear();
+                stateRxHaveCount = 0;
+                stateSize = 0;
+                stateCrc = 0;
+                stateChunkCount = 0;
+                stateSyncDeadline = {};
+            }
+            return selfStateReady;
+        }
+
+        // SaveRAM gating only applies when explicitly requested.
+        if (isHost && saveRamGate) return peerSaveRamReady;
+        if (!isHost && saveRamGate) return selfSaveRamReady;
+        return true;
     }
 
     void markPeerConnected_(const sockaddr_in6& from) noexcept {
@@ -1006,6 +1074,7 @@ struct UdpNetplay {
                 stateRxHaveCount = 0;
                 selfStateReady = false;
                 joinAwaitingStateOffer = false;
+                stateSyncDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
                 continue;
             }
 
@@ -1076,10 +1145,20 @@ struct UdpNetplay {
                 if (n >= 12) {
                     const uint32_t sz = read_u32_be_(buf + 4);
                     const uint32_t crc = read_u32_be_(buf + 8);
-                    if (sz == stateSize && crc == stateCrc) peerStateReady = true;
+                    if (sz == stateSize && crc == stateCrc) {
+                        if (!peerStateReady && wantStateSync && !stateTx.empty()) {
+                            (void)loadStateBytes_(stateTx.data(), stateTx.size());
+                        }
+                        peerStateReady = true;
+                    }
                 } else if (n >= 8) {
                     const uint32_t crc = read_u32_be_(buf + 4);
-                    if (crc == stateCrc) peerStateReady = true;
+                    if (crc == stateCrc) {
+                        if (!peerStateReady && wantStateSync && !stateTx.empty()) {
+                            (void)loadStateBytes_(stateTx.data(), stateTx.size());
+                        }
+                        peerStateReady = true;
+                    }
                 }
                 continue;
             }
@@ -1563,13 +1642,9 @@ bool snesonline_ios_initialize(const char* corePath,
                 }
             }
 
-            // Best-effort: load a state before starting.
-            if (pnum == 1 && statePath && statePath[0]) {
-                std::vector<uint8_t> bytes;
-                if (readFile_(statePath, bytes)) {
-                    (void)loadStateBytes_(bytes.data(), bytes.size());
-                }
-            }
+            // Note: we intentionally do NOT load a saved state locally before netplay starts.
+            // The host applies the state only after the peer acknowledges it, so we can fall back
+            // cleanly if the peer can't load the state.
 
             g_netplay = std::move(np);
             g_netplayEnabled.store(true, std::memory_order_relaxed);

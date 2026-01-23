@@ -305,6 +305,7 @@ struct UdpNetplay {
     uint16_t stateChunkSize = 1024;
     uint16_t stateChunkCount = 0;
     std::chrono::steady_clock::time_point lastInfoSent{};
+    std::chrono::steady_clock::time_point stateSyncDeadline{};
     uint16_t nextChunkToSend = 0;
 
     std::vector<uint8_t> stateRx;
@@ -341,6 +342,7 @@ struct UdpNetplay {
         selfStateReady = true;
         nextChunkToSend = 0;
         lastInfoSent = {};
+        stateSyncDeadline = wantStateSync ? (std::chrono::steady_clock::now() + std::chrono::seconds(10)) : std::chrono::steady_clock::time_point{};
     }
 
     void configureStateSyncJoiner() noexcept {
@@ -350,6 +352,7 @@ struct UdpNetplay {
         selfStateReady = true;
         joinAwaitingStateOffer = true;
         joinWaitStateOfferDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        stateSyncDeadline = {};
         stateRx.clear();
         stateRxHave.clear();
         stateRxHaveCount = 0;
@@ -648,6 +651,24 @@ struct UdpNetplay {
         remotePort = (rPort != 0) ? rPort : 7000;
         localPlayerNum = (lPlayer == 2) ? 2 : 1;
 
+        // Gameplay role (P1 = host, P2 = joiner), independent of whether state sync is active.
+        isHost = (localPlayerNum == 1);
+
+        // Reset sync gating state; later we may enable state/SRAM sync explicitly.
+        wantStateSync = false;
+        peerStateReady = true;
+        selfStateReady = true;
+        joinAwaitingStateOffer = false;
+        joinWaitStateOfferDeadline = {};
+        stateSyncDeadline = {};
+
+        wantSaveRamSync = false;
+        saveRamGate = false;
+        peerSaveRamReady = true;
+        selfSaveRamReady = true;
+        joinAwaitingSaveRamOffer = false;
+        joinWaitSaveRamOfferDeadline = {};
+
         remoteFrameTag.fill(0xFFFFFFFFu);
         remoteMask.fill(0);
         sentFrameTag.fill(0xFFFFFFFFu);
@@ -868,6 +889,7 @@ struct UdpNetplay {
                     wantStateSync = true;
                     selfStateReady = false;
                     joinAwaitingStateOffer = false;
+                    stateSyncDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
                     stateSize = sz;
                     stateCrc = crc;
                     stateChunkSize = csz;
@@ -1214,14 +1236,44 @@ struct UdpNetplay {
 
     bool readyToRun() noexcept {
         if (!hasPeer) return false;
+        const auto now = std::chrono::steady_clock::now();
         if (!isHost && joinAwaitingStateOffer) {
-            if (std::chrono::steady_clock::now() < joinWaitStateOfferDeadline) {
+            if (now < joinWaitStateOfferDeadline) {
                 return false;
             }
             joinAwaitingStateOffer = false;
         }
-        if (isHost && wantStateSync) return peerStateReady;
-        if (!isHost && wantStateSync) return selfStateReady;
+
+        if (isHost && wantStateSync) {
+            if (!peerStateReady && stateSyncDeadline.time_since_epoch().count() != 0 && now > stateSyncDeadline) {
+                // Peer never acked (likely couldn't load the state). Fall back to starting from reset.
+                wantStateSync = false;
+                peerStateReady = true;
+                selfStateReady = true;
+                stateTx.clear();
+                stateSize = 0;
+                stateCrc = 0;
+                stateChunkCount = 0;
+                stateSyncDeadline = {};
+            }
+            return peerStateReady;
+        }
+        if (!isHost && wantStateSync) {
+            if (!selfStateReady && stateSyncDeadline.time_since_epoch().count() != 0 && now > stateSyncDeadline) {
+                // State offer received but never successfully loaded. Fall back to starting from reset.
+                wantStateSync = false;
+                selfStateReady = true;
+                peerStateReady = true;
+                stateRx.clear();
+                stateRxHave.clear();
+                stateRxHaveCount = 0;
+                stateSize = 0;
+                stateCrc = 0;
+                stateChunkCount = 0;
+                stateSyncDeadline = {};
+            }
+            return selfStateReady;
+        }
         if (isHost && saveRamGate) return peerSaveRamReady;
         if (!isHost && saveRamGate) return selfSaveRamReady;
         return true;
