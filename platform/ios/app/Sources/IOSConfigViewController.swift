@@ -39,8 +39,6 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
     private let showTouchSwitch = UISwitch()
     private let showSaveSwitch = UISwitch()
 
-    private let audioTitleLabel = UILabel()
-
     private let netplayTitleLabel = UILabel()
     private let netplaySwitch = UISwitch()
     private let localPortField = UITextField()
@@ -120,13 +118,6 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         stack.addArrangedSubview(makeRow(label: "Show on-screen controls (touch)", control: showTouchSwitch))
         stack.addArrangedSubview(makeRow(label: "Show in-game State button", control: showSaveSwitch))
 
-        // Audio (header only, like Android)
-        audioTitleLabel.text = "Audio"
-        audioTitleLabel.font = UIFont.systemFont(ofSize: 16, weight: .regular)
-        audioTitleLabel.textColor = UiStyle.configText
-        audioTitleLabel.layoutMargins = UIEdgeInsets(top: 12, left: 0, bottom: 0, right: 0)
-        stack.addArrangedSubview(audioTitleLabel)
-
         // Netplay
         netplayTitleLabel.text = "Netplay"
         netplayTitleLabel.font = UIFont.systemFont(ofSize: 16, weight: .regular)
@@ -155,7 +146,7 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         connectionCodeField.layer.cornerRadius = 8
         connectionCodeField.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         connectionCodeField.textColor = UiStyle.configText
-        connectionCodeField.backgroundColor = .white
+        connectionCodeField.backgroundColor = UiStyle.primaryBase.withAlphaComponent(0.35)
         connectionCodeField.text = ""
         connectionCodeField.heightAnchor.constraint(equalToConstant: 90).isActive = true
         stack.addArrangedSubview(connectionCodeField)
@@ -246,6 +237,14 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         let hint = UiStyle.configText.withAlphaComponent(160.0 / 255.0)
         romPathField.attributedPlaceholder = NSAttributedString(string: romPathField.placeholder ?? "", attributes: [.foregroundColor: hint])
         localPortField.attributedPlaceholder = NSAttributedString(string: localPortField.placeholder ?? "", attributes: [.foregroundColor: hint])
+
+        // Ensure text inputs match the app palette.
+        romPathField.textColor = UiStyle.configText
+        localPortField.textColor = UiStyle.configText
+        romPathField.tintColor = UiStyle.accent2
+        localPortField.tintColor = UiStyle.accent2
+        romPathField.backgroundColor = UiStyle.primaryBase.withAlphaComponent(0.35)
+        localPortField.backgroundColor = UiStyle.primaryBase.withAlphaComponent(0.35)
     }
 
     private func applyInteractiveTheme() {
@@ -283,7 +282,7 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
         let d = UserDefaults.standard
         netplaySwitch.isOn = d.bool(forKey: Keys.enableNetplay)
         showTouchSwitch.isOn = d.object(forKey: Keys.showOnscreenControls) == nil ? true : d.bool(forKey: Keys.showOnscreenControls)
-        showSaveSwitch.isOn = d.bool(forKey: Keys.showSaveButton)
+        showSaveSwitch.isOn = d.object(forKey: Keys.showSaveButton) == nil ? true : d.bool(forKey: Keys.showSaveButton)
 
         localPortField.text = String(d.integer(forKey: Keys.localPort) == 0 ? 7000 : d.integer(forKey: Keys.localPort))
 
@@ -436,7 +435,8 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
                 let d = UserDefaults.standard
                 d.set(1, forKey: Keys.localPlayerNum)
                 d.set("", forKey: Keys.remoteHost)
-                d.set(7000, forKey: Keys.remotePort)
+                d.set(0, forKey: Keys.remotePort)
+                d.set(lp, forKey: Keys.localPort)
 
                 self.setStatus("Paste the code on the other device and press Join connection")
                 self.applyConnectionUiState(.hostReady)
@@ -644,10 +644,43 @@ final class IOSConfigViewController: UIViewController, UIDocumentPickerDelegate,
     }
 
     @objc private func copyCode() {
-        let s = (connectionCodeField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return }
-        UIPasteboard.general.string = s
-        setStatus("Copied")
+        let code = (connectionCodeField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !code.isEmpty else { return }
+        var comps = URLComponents()
+        comps.scheme = "snesonline"
+        comps.host = "join"
+        comps.queryItems = [URLQueryItem(name: "code", value: code)]
+        let link = comps.url?.absoluteString ?? code
+        UIPasteboard.general.string = link
+        setStatus("Copied invite link")
+    }
+
+    // Deep-link entrypoint: snesonline://join?code=SNO2:...
+    func applyInviteLink(_ url: URL) {
+        guard url.scheme?.lowercased() == "snesonline" else { return }
+        guard url.host?.lowercased() == "join" else { return }
+        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }
+        guard let code = comps.queryItems?.first(where: { $0.name == "code" })?.value, !code.isEmpty else { return }
+
+        netplaySwitch.isOn = true
+        applySwitchTheme(netplaySwitch)
+        connectionCodeField.text = code
+        UserDefaults.standard.set(code, forKey: Keys.connectionCode)
+
+        // Attempt to auto-accept the join code.
+        do {
+            let ep = try ConnectionCode.decodePublicEndpoint(from: code)
+            let d = UserDefaults.standard
+            d.set(ep.host, forKey: Keys.remoteHost)
+            d.set(ep.port, forKey: Keys.remotePort)
+            d.set(2, forKey: Keys.localPlayerNum)
+            setStatus("")
+            applyConnectionUiState(.joinReady)
+        } catch {
+            setStatus("Paste the code")
+            applyConnectionUiState(.joinInput)
+        }
+        updateStartButtonEnabled()
     }
 }
 

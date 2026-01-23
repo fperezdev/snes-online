@@ -243,6 +243,16 @@ public class ConfigActivity extends Activity {
         cm.setPrimaryClip(ClipData.newPlainText(label, text));
     }
 
+    private static String makeInviteLink(String code) {
+        if (code == null) code = "";
+        return new Uri.Builder()
+                .scheme("snesonline")
+                .authority("join")
+                .appendQueryParameter("code", code)
+                .build()
+                .toString();
+    }
+
     private void toastCopied() {
         Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show();
     }
@@ -529,7 +539,7 @@ public class ConfigActivity extends Activity {
 
                     runOnUiThread(() -> {
                         editConnectionCode.setText(connectionCode);
-                        copyToClipboard(this, "Connection code", connectionCode);
+                        copyToClipboard(this, "Invite link", makeInviteLink(connectionCode));
                         toastCopied();
                         netplayRole = 1;
                         switchNetplay.setChecked(true);
@@ -609,7 +619,7 @@ public class ConfigActivity extends Activity {
         if (btnCopyConnectionIcon != null) {
             btnCopyConnectionIcon.setOnClickListener(v -> {
                 if (connectionCode == null || connectionCode.trim().isEmpty()) return;
-                copyToClipboard(this, "Connection code", connectionCode);
+                copyToClipboard(this, "Invite link", makeInviteLink(connectionCode));
                 toastCopied();
             });
         }
@@ -630,6 +640,64 @@ public class ConfigActivity extends Activity {
             setStatus("");
             updateStartButtonEnabled();
         });
+
+        // Handle snesonline://join?code=... deep links.
+        handleInviteIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleInviteIntent(intent);
+    }
+
+    private void handleInviteIntent(Intent intent) {
+        if (intent == null) return;
+        Uri data = intent.getData();
+        if (data == null) return;
+        if (!"snesonline".equalsIgnoreCase(data.getScheme())) return;
+        if (!"join".equalsIgnoreCase(data.getHost())) return;
+        String code = data.getQueryParameter("code");
+        if (code == null) code = "";
+        code = code.trim();
+        if (code.isEmpty()) return;
+
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+
+        // Best-effort: ensure netplay is enabled and we are in join flow.
+        netplayEnabled = true;
+        netplayRole = 2;
+        if (switchNetplay != null) switchNetplay.setChecked(true);
+
+        if (editConnectionCode != null) editConnectionCode.setText(code);
+        connectionCode = code;
+
+        localPort = parseIntOr(editLocalPort.getText().toString().trim(), 7000);
+        if (!isValidPort(localPort)) localPort = 7000;
+
+        try {
+            ConnInfo info = decodeConnectionCode(code);
+            resolvedRemoteHost = info.publicIp;
+            resolvedRemotePort = info.publicPort;
+
+            prefs.edit()
+                    .putBoolean(PREF_NETPLAY_ENABLED, true)
+                    .putInt(PREF_LOCAL_PORT, localPort)
+                    .putString(PREF_CONNECTION_CODE, connectionCode)
+                    .putInt(PREF_NETPLAY_ROLE, 2)
+                    .putString(PREF_REMOTE_HOST, resolvedRemoteHost)
+                    .putInt(PREF_REMOTE_PORT, resolvedRemotePort)
+                    .apply();
+
+            applyConnectionUiState(ConnectionUiState.JOIN_READY);
+            setStatus("");
+        } catch (Exception e) {
+            applyConnectionUiState(ConnectionUiState.JOIN_INPUT);
+            setStatus("Invalid invite link: " + e.getMessage());
+        }
+
+        updateStartButtonEnabled();
     }
 
     private void applyConfigTheme() {

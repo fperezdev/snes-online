@@ -24,6 +24,11 @@ final class IOSGameViewController: UIViewController {
     private let imageView = UIImageView()
     private let waitingLabel = UILabel()
 
+    private let backToConfigButton = UIButton(type: .system)
+    private let stateButtonOverlay = UIButton(type: .system)
+
+    private var waitingInputsSince: CFTimeInterval?
+
     private var displayLink: CADisplayLink?
 
     private var audioEngine: AVAudioEngine?
@@ -51,13 +56,23 @@ final class IOSGameViewController: UIViewController {
         view.backgroundColor = .black
 
         // Android has no action bar; prefer fullscreen UX.
-        // Provide a fallback nav-bar State button only when touch controls are hidden.
-        if config.showSaveButton && !config.showOnscreenControls {
-            navigationItem.rightBarButtonItem = UIBarButtonItem(title: "State",
-                                                                style: .plain,
-                                                                target: self,
-                                                                action: #selector(showStateMenu))
-        }
+        // Provide in-game overlay buttons instead of relying on a hidden nav-bar.
+        backToConfigButton.setTitle("Config", for: .normal)
+        backToConfigButton.setTitleColor(.white, for: .normal)
+        backToConfigButton.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        backToConfigButton.layer.cornerRadius = 10
+        backToConfigButton.contentEdgeInsets = UIEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        backToConfigButton.addTarget(self, action: #selector(backToConfigTapped), for: .touchUpInside)
+        backToConfigButton.translatesAutoresizingMaskIntoConstraints = false
+
+        stateButtonOverlay.setTitle("State", for: .normal)
+        stateButtonOverlay.setTitleColor(.white, for: .normal)
+        stateButtonOverlay.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        stateButtonOverlay.layer.cornerRadius = 10
+        stateButtonOverlay.contentEdgeInsets = UIEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        stateButtonOverlay.addTarget(self, action: #selector(showStateMenu), for: .touchUpInside)
+        stateButtonOverlay.translatesAutoresizingMaskIntoConstraints = false
+        stateButtonOverlay.isHidden = !config.showSaveButton
 
         imageView.contentMode = .scaleAspectFit
         imageView.translatesAutoresizingMaskIntoConstraints = false
@@ -71,6 +86,8 @@ final class IOSGameViewController: UIViewController {
 
         view.addSubview(imageView)
         view.addSubview(waitingLabel)
+        view.addSubview(backToConfigButton)
+        view.addSubview(stateButtonOverlay)
 
         NSLayoutConstraint.activate([
             imageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -82,6 +99,14 @@ final class IOSGameViewController: UIViewController {
             waitingLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
             waitingLabel.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 24),
             waitingLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24)
+        ])
+
+        NSLayoutConstraint.activate([
+            backToConfigButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 14),
+            backToConfigButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
+
+            stateButtonOverlay.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -14),
+            stateButtonOverlay.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10)
         ])
 
         if config.showOnscreenControls {
@@ -267,11 +292,28 @@ final class IOSGameViewController: UIViewController {
         // Update netplay waiting UI.
         if config.enableNetplay {
             let st = NativeBridgeIOS.netplayStatus()
-            waitingLabel.isHidden = (st == 3)
-            if st == 1 { waitingLabel.text = "WAITING FOR PEER..." }
-            else if st == 2 { waitingLabel.text = "WAITING FOR INPUTS..." }
-            else if st == 4 { waitingLabel.text = "SYNCING STATE..." }
-            else if st == 3 { /* hidden */ }
+            if st != 2 { waitingInputsSince = nil }
+
+            if st == 1 {
+                waitingLabel.isHidden = false
+                waitingLabel.text = "WAITING FOR PEER..."
+            } else if st == 2 {
+                let now = CACurrentMediaTime()
+                if waitingInputsSince == nil { waitingInputsSince = now }
+                let elapsed = now - (waitingInputsSince ?? now)
+                if elapsed < 1.0 {
+                    // Avoid flashing the overlay for brief stalls.
+                    waitingLabel.isHidden = true
+                } else {
+                    waitingLabel.isHidden = false
+                    waitingLabel.text = "WAITING FOR INPUTS..."
+                }
+            } else if st == 4 {
+                waitingLabel.isHidden = false
+                waitingLabel.text = "SYNCING STATE..."
+            } else {
+                waitingLabel.isHidden = true
+            }
         } else {
             waitingLabel.isHidden = true
         }
@@ -341,6 +383,10 @@ final class IOSGameViewController: UIViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         navigationController?.setNavigationBarHidden(true, animated: animated)
+    }
+
+    @objc private func backToConfigTapped() {
+        navigationController?.popViewController(animated: true)
     }
 
     @objc private func showStateMenu() {

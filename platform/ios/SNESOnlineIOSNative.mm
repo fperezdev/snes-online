@@ -261,6 +261,12 @@ struct UdpNetplay {
     std::chrono::steady_clock::time_point lastRecv{};
     std::chrono::steady_clock::time_point lastKeepAliveSent{};
 
+    // While hosting and waiting for the first inbound packet, we still need outbound UDP traffic
+    // to keep the NAT mapping alive so the joiner can reach us.
+    sockaddr_in6 natPunchTarget{};
+    bool natPunchReady = false;
+    std::chrono::steady_clock::time_point lastNatPunchSent{};
+
     struct Packet {
         uint32_t magic_be;
         uint32_t frame_be;
@@ -646,6 +652,10 @@ struct UdpNetplay {
         hasPeer = false;
         lastRecv = {};
 
+        natPunchTarget = {};
+        natPunchReady = false;
+        lastNatPunchSent = {};
+
         discoverPeer = false;
 
         sock = ::socket(AF_INET6, SOCK_DGRAM, 0);
@@ -678,8 +688,20 @@ struct UdpNetplay {
             discoverPeer = (localPlayerNum == 1);
             remote = {};
             remote.sin6_family = AF_INET6;
-            remote.sin6_port = htons(remotePort);
+            remote.sin6_port = 0;
             remote.sin6_addr = in6addr_loopback;
+
+            // Host: pick a best-effort public UDP target to keep the NAT mapping alive.
+            // This does not need to respond; any outbound traffic from this bound socket is enough.
+            if (discoverPeer) {
+                static constexpr const char* kNatPunchHost = "stun.l.google.com";
+                static constexpr uint16_t kNatPunchPort = 19302;
+                sockaddr_in6 tmp{};
+                if (resolveIpAnyToIn6_(kNatPunchHost, tmp, kNatPunchPort)) {
+                    natPunchTarget = tmp;
+                    natPunchReady = true;
+                }
+            }
         }
 
         // Joiner: if no direct host endpoint is known, use the room-server rendezvous.
@@ -1065,8 +1087,30 @@ struct UdpNetplay {
         sendto(sock, pkt, sizeof(pkt), 0, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
     }
 
+    void sendNatPunchIfWaitingForPeer() noexcept {
+        if (sock < 0) return;
+        if (!discoverPeer) return;
+        if (hasPeer) return;
+        if (!natPunchReady) return;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (lastNatPunchSent.time_since_epoch().count() != 0 && (now - lastNatPunchSent) < std::chrono::milliseconds(500)) {
+            return;
+        }
+        lastNatPunchSent = now;
+
+        uint8_t pkt[8] = {};
+        write_u32_be_(pkt, kMagicKeepAlive);
+        write_u32_be_(pkt + 4, 0);
+        sendto(sock, pkt, sizeof(pkt), 0, reinterpret_cast<const sockaddr*>(&natPunchTarget), sizeof(natPunchTarget));
+    }
+
     void sendLocal(uint16_t localMask) noexcept {
         if (sock < 0) return;
+
+        // Host auto-discovery: don't send inputs until we know where to send them.
+        if (discoverPeer && !hasPeer) return;
+        if (remote.sin6_family != AF_INET6 || remote.sin6_port == 0) return;
 
         const uint32_t sendFrame = frame + kInputDelayFrames;
         const uint32_t idx = sendFrame % kBufN;
@@ -1221,6 +1265,10 @@ void loop60fps() {
 
             if (g_netplayEnabled.load(std::memory_order_relaxed) && g_netplay) {
                 g_netplay->pumpRecv();
+
+                // While hosting and waiting for peer discovery, keep NAT mapping alive.
+                g_netplay->sendNatPunchIfWaitingForPeer();
+
                 if (paused) {
                     g_netplay->sendKeepAlive();
                 } else {
